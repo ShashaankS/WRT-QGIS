@@ -2,7 +2,7 @@
 name=Weather Routing Tool QGIS Plugin
 qgisMinimumVersion=3.16
 description=QGIS Plugin for the Weather Routing Tool (52north WRT)
-version=1.0.0
+version=0.1.0
 author=Shashaank Srivastava
 email=shashaank.srivastava04@gmail.com
 about=About WRT-QGIS Plugin
