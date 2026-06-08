@@ -18,9 +18,8 @@ yourself from the source:
 
 ```bash
 git clone https://github.com/52north/WRT-QGIS.git
-cd WRT-QGIS
 # Create a ZIP whose top-level folder matches the plugin name
-zip -r WRT-QGIS.zip . -x ".git/*" ".gitignore"
+zip -r WRT-QGIS.zip WRT-QGIS -x "WRT-QGIS/.git/*" "WRT-QGIS/.gitignore"
 ```
 
 ### 2. Install through the QGIS Plugin Manager
