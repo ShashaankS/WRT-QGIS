@@ -1,15 +1,31 @@
-"""Page 2 — Boat configuration."""
+"""Page 3 — Boat configuration."""
 from qgis.PyQt.QtWidgets import (
     QWizardPage, QVBoxLayout, QFormLayout, QLabel, QLineEdit,
     QComboBox, QGroupBox, QPushButton,
-    QWidget, QScrollArea, QHBoxLayout, QStackedWidget
+    QWidget, QScrollArea, QHBoxLayout, QStackedWidget,
 )
 from qgis.PyQt.QtCore import Qt
-from .defaults import BOAT_TYPE_OPTIONS, KNOTS_TO_MS
-from .ui_kit import (
-    COLOR_WARNING, StatusLine, collapsible, dspin, ispin, join_terms,
-    opt_label, page_header, req_label,
+from ..core.defaults import (
+    BOAT_TYPE_OPTIONS, ALGO_BOAT_COMPAT, ALGO_BOAT_COMPAT_DEFAULT,
 )
+from ..ui.ui_kit import (
+    COLOR_MUTED, COLOR_WARNING, StatusLine, collapsible, dspin, field_label,
+    ispin, join_terms, opt_label, page_header, req_label,
+)
+
+_BOAT_TYPE_LABELS = dict(BOAT_TYPE_OPTIONS)
+
+# Fixed stack position per boat type — independent of the (filtered) combo order.
+_BOAT_STACK = {
+    "direct_power_method": 0,
+    "CBT": 1,
+    "speedy_isobased": 2,
+}
+
+
+def _compatible_boat_types(algo):
+    """Boat types valid for the chosen algorithm (Page 1 picks algorithm first)."""
+    return ALGO_BOAT_COMPAT.get(algo, ALGO_BOAT_COMPAT_DEFAULT)
 
 
 # Every boat-related config key — cleared on save so only the active method contributes to the exported JSON.
@@ -70,37 +86,39 @@ class BoatPage(QWizardPage):
             "Fields marked * are required.",
         ))
 
-        # Type + common fields
-        common_box = QGroupBox("Vessel basics")
-        common_form = QFormLayout(common_box)
-        common_form.setLabelAlignment(Qt.AlignRight)
-        common_form.setSpacing(8)
-
+        # Boat type
+        root.addWidget(field_label("Boat type", required=True))
         self.boat_type = QComboBox()
-        for val, label in BOAT_TYPE_OPTIONS:
-            self.boat_type.addItem(label, val)
         self.boat_type.currentIndexChanged.connect(self._on_boat_type_changed)
+        root.addWidget(self.boat_type)
 
-        self.speed_knots = dspin(val=12.0, suffix="knots", mx=100)
-        self.speed_knots.valueChanged.connect(self.completeChanged)
+        # Speed
+        self.speed_label = field_label("Speed", required=True)
+        root.addWidget(self.speed_label)
+        self.speed_ms = dspin(val=6.17, suffix="m/s", mx=60, dec=3)
+        self.speed_ms.valueChanged.connect(self.completeChanged)
+        root.addWidget(self.speed_ms)
 
-        common_form.addRow(req_label("Boat type"), self.boat_type)
-        common_form.addRow(req_label("Speed"), self.speed_knots)
-        root.addWidget(common_box)
+        # Shown instead of the speed field for all genetic intents (speed is set on the Algorithm step).
+        self.speed_note = QLabel(
+            "Speed is configured in the Algorithm step for the genetic algorithm."
+        )
+        self.speed_note.setWordWrap(True)
+        self.speed_note.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+        root.addWidget(self.speed_note)
 
         # Per-type parameter stack
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_direct_power_panel())   # 0
         self.stack.addWidget(self._build_cbt_panel())            # 1
-        self.stack.addWidget(self._build_sal_panel())            # 2
-        self.stack.addWidget(self._build_speedy_panel())         # 3
+        self.stack.addWidget(self._build_speedy_panel())         # 2
         root.addWidget(self.stack)
 
         root.addStretch()
         self._update_status()
 
     def _maripower_advanced(self, prefix):
-        """Shared advanced parameters for the maripower-based methods (CBT, SAL)."""
+        """Shared advanced parameters for the CBT maripower method."""
         btn, box = collapsible("Advanced — hull & propulsion")
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
@@ -249,36 +267,6 @@ class BoatPage(QWizardPage):
         v.addStretch()
         return w
 
-    def _build_sal_panel(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(10)
-
-        req = QGroupBox("Required — SAL (maripower)")
-        form = QFormLayout(req)
-        form.setLabelAlignment(Qt.AlignRight)
-        form.setSpacing(8)
-        self.sal_length = dspin(suffix="m")
-        self.sal_breadth = dspin(suffix="m")
-        self.sal_smcr_power = dspin(suffix="kW", mx=999999)
-        self.sal_smcr_speed = dspin(dec=3, suffix="m/s")
-        self.sal_fuel_rate = dspin(suffix="g/kWh", mx=9999)
-        for x in (self.sal_length, self.sal_breadth, self.sal_smcr_power, self.sal_smcr_speed, self.sal_fuel_rate):
-            x.valueChanged.connect(self.completeChanged)
-        form.addRow(req_label("Length overall"), self.sal_length)
-        form.addRow(req_label("Breadth"), self.sal_breadth)
-        form.addRow(req_label("SMCR power"), self.sal_smcr_power)
-        form.addRow(req_label("Avg. speed at SMCR"), self.sal_smcr_speed)
-        form.addRow(req_label("Fuel rate"), self.sal_fuel_rate)
-        v.addWidget(req)
-
-        btn, box = self._maripower_advanced("sal")
-        v.addWidget(btn)
-        v.addWidget(box)
-        v.addStretch()
-        return w
-
     def _build_speedy_panel(self):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -296,8 +284,32 @@ class BoatPage(QWizardPage):
 
     # Behaviour
     def _on_boat_type_changed(self, idx):
-        self.stack.setCurrentIndex(idx)
+        bt = self.boat_type.currentData()
+        self.stack.setCurrentIndex(_BOAT_STACK.get(bt, 0))
         self.completeChanged.emit()
+
+    def _populate_boat_types(self):
+        """Restrict the boat-type combo to the types valid for the chosen algorithm."""
+        algo = self.config.get("ALGORITHM_TYPE", "isofuel")
+        allowed = _compatible_boat_types(algo)
+        current = self.boat_type.currentData()
+        self.boat_type.blockSignals(True)
+        self.boat_type.clear()
+        for val in allowed:
+            self.boat_type.addItem(_BOAT_TYPE_LABELS.get(val, val), val)
+        idx = self.boat_type.findData(current)
+        self.boat_type.setCurrentIndex(idx if idx >= 0 else 0)
+        self.boat_type.blockSignals(False)
+
+    def _speed_hidden(self):
+        """Speed is always configured on the Algorithm step for genetic — never asked here."""
+        return self.config.get("ALGORITHM_TYPE") == "genetic"
+
+    def _apply_speed_visibility(self):
+        hidden = self._speed_hidden()
+        self.speed_label.setVisible(not hidden)
+        self.speed_ms.setVisible(not hidden)
+        self.speed_note.setVisible(hidden)
 
     def _browse_file(self, line_edit, file_filter):
         from qgis.PyQt.QtWidgets import QFileDialog
@@ -309,7 +321,7 @@ class BoatPage(QWizardPage):
         """List the required fields not yet set, for the active boat type."""
         bt = self.boat_type.currentData()
         missing = []
-        if self.speed_knots.value() <= 0:
+        if not self._speed_hidden() and self.speed_ms.value() <= 0:
             missing.append("speed")
         if bt == "speedy_isobased":
             return missing
@@ -327,12 +339,6 @@ class BoatPage(QWizardPage):
             if self.cbt_smcr_speed.value() <= 0: missing.append("speed at SMCR")
             if self.cbt_fuel_rate.value() <= 0: missing.append("fuel rate")
             if not self.cbt_courses.text().strip(): missing.append("courses file")
-        elif bt == "SAL":
-            if self.sal_length.value() <= 0: missing.append("length")
-            if self.sal_breadth.value() <= 0: missing.append("breadth")
-            if self.sal_smcr_power.value() <= 0: missing.append("SMCR power")
-            if self.sal_smcr_speed.value() <= 0: missing.append("speed at SMCR")
-            if self.sal_fuel_rate.value() <= 0: missing.append("fuel rate")
         return missing
 
     def _update_status(self):
@@ -346,7 +352,7 @@ class BoatPage(QWizardPage):
 
     def isComplete(self):
         bt = self.boat_type.currentData()
-        if self.speed_knots.value() <= 0:
+        if not self._speed_hidden() and self.speed_ms.value() <= 0:
             return False
         if bt == "speedy_isobased":
             return True
@@ -358,10 +364,6 @@ class BoatPage(QWizardPage):
             return (self.cbt_length.value() > 0 and self.cbt_breadth.value() > 0 and
                     self.cbt_smcr_power.value() > 0 and self.cbt_smcr_speed.value() > 0 and
                     self.cbt_fuel_rate.value() > 0 and bool(self.cbt_courses.text().strip()))
-        if bt == "SAL":
-            return (self.sal_length.value() > 0 and self.sal_breadth.value() > 0 and
-                    self.sal_smcr_power.value() > 0 and self.sal_smcr_speed.value() > 0 and
-                    self.sal_fuel_rate.value() > 0)
         return True
 
     # Config persistence
@@ -372,7 +374,10 @@ class BoatPage(QWizardPage):
 
         bt = self.boat_type.currentData()
         c["BOAT_TYPE"] = bt
-        c["BOAT_SPEED"] = round(self.speed_knots.value() * KNOTS_TO_MS, 4)  # knots -> m/s
+        # In genetic waypoints-only "via arrival" mode the schedule is fixed by
+        # arrival time, so BOAT_SPEED is left unset (the optimization page owns it).
+        if not self._speed_hidden():
+            c["BOAT_SPEED"] = self.speed_ms.value()
 
         if bt == "direct_power_method":
             c["BOAT_LENGTH"] = self.dp_length.value()
@@ -386,13 +391,6 @@ class BoatPage(QWizardPage):
             c["BOAT_FUEL_RATE"] = self.cbt_fuel_rate.value()
             c["COURSES_FILE"] = self.cbt_courses.text().strip()
             self._save_maripower(c, "cbt")
-        elif bt == "SAL":
-            c["BOAT_LENGTH"] = self.sal_length.value()
-            c["BOAT_BREADTH"] = self.sal_breadth.value()
-            c["BOAT_SMCR_POWER"] = self.sal_smcr_power.value()
-            c["BOAT_SMCR_SPEED"] = self.sal_smcr_speed.value()
-            c["BOAT_FUEL_RATE"] = self.sal_fuel_rate.value()
-            self._save_maripower(c, "sal")
         # speedy_isobased: only the common fields above.
 
     def _save_direct(self, c):
@@ -436,10 +434,8 @@ class BoatPage(QWizardPage):
         self.dp_breadth.setValue(breadth_val)
         self.cbt_length.setValue(length_val)
         self.cbt_breadth.setValue(breadth_val)
-        self.sal_length.setValue(length_val)
-        self.sal_breadth.setValue(breadth_val)
         raw_speed = float(c.get("BOAT_SPEED") or 0)
-        self.speed_knots.setValue(round(raw_speed / KNOTS_TO_MS, 2) if raw_speed else 12.0)
+        self.speed_ms.setValue(raw_speed if raw_speed else 6.17)
 
         # Direct power method
         self.dp_smcr_power.setValue(float(c.get("BOAT_SMCR_POWER") or 0))
@@ -460,27 +456,29 @@ class BoatPage(QWizardPage):
         for attr, key in ADV_KEYS:
             getattr(self, attr).setValue(float(c.get(key) or 0))
 
-        # Maripower methods
-        for p in ("cbt", "sal"):
-            getattr(self, f"{p}_smcr_power").setValue(float(c.get("BOAT_SMCR_POWER") or 0))
-            getattr(self, f"{p}_smcr_speed").setValue(float(c.get("BOAT_SMCR_SPEED") or 0))
-            getattr(self, f"{p}_fuel_rate").setValue(float(c.get("BOAT_FUEL_RATE") or 0))
-            getattr(self, f"{p}_draught_aft").setValue(float(c.get("BOAT_DRAUGHT_AFT") or 10))
-            getattr(self, f"{p}_draught_fore").setValue(float(c.get("BOAT_DRAUGHT_FORE") or 10))
-            getattr(self, f"{p}_roughness_dist").setValue(int(c.get("BOAT_ROUGHNESS_DISTRIBUTION_LEVEL") or 1))
-            getattr(self, f"{p}_roughness_lvl").setValue(int(c.get("BOAT_ROUGHNESS_LEVEL") or 1))
-            getattr(self, f"{p}_under_keel").setValue(float(c.get("BOAT_UNDER_KEEL_CLEARANCE") or 20))
-            getattr(self, f"{p}_overload").setValue(float(c.get("BOAT_OVERLOAD_FACTOR") or 0))
-            getattr(self, f"{p}_prop_eff").setValue(float(c.get("BOAT_PROPULSION_EFFICIENCY") or 0.63))
-            getattr(self, f"{p}_factor_calm").setValue(float(c.get("BOAT_FACTOR_CALM_WATER") or 1))
-            getattr(self, f"{p}_factor_wave").setValue(float(c.get("BOAT_FACTOR_WAVE_FORCES") or 1))
-            getattr(self, f"{p}_factor_wind").setValue(float(c.get("BOAT_FACTOR_WIND_FORCES") or 1))
+        # CBT (maripower)
+        self.cbt_smcr_power.setValue(float(c.get("BOAT_SMCR_POWER") or 0))
+        self.cbt_smcr_speed.setValue(float(c.get("BOAT_SMCR_SPEED") or 0))
+        self.cbt_fuel_rate.setValue(float(c.get("BOAT_FUEL_RATE") or 0))
+        self.cbt_draught_aft.setValue(float(c.get("BOAT_DRAUGHT_AFT") or 10))
+        self.cbt_draught_fore.setValue(float(c.get("BOAT_DRAUGHT_FORE") or 10))
+        self.cbt_roughness_dist.setValue(int(c.get("BOAT_ROUGHNESS_DISTRIBUTION_LEVEL") or 1))
+        self.cbt_roughness_lvl.setValue(int(c.get("BOAT_ROUGHNESS_LEVEL") or 1))
+        self.cbt_under_keel.setValue(float(c.get("BOAT_UNDER_KEEL_CLEARANCE") or 20))
+        self.cbt_overload.setValue(float(c.get("BOAT_OVERLOAD_FACTOR") or 0))
+        self.cbt_prop_eff.setValue(float(c.get("BOAT_PROPULSION_EFFICIENCY") or 0.63))
+        self.cbt_factor_calm.setValue(float(c.get("BOAT_FACTOR_CALM_WATER") or 1))
+        self.cbt_factor_wave.setValue(float(c.get("BOAT_FACTOR_WAVE_FORCES") or 1))
+        self.cbt_factor_wind.setValue(float(c.get("BOAT_FACTOR_WIND_FORCES") or 1))
         self.cbt_courses.setText(c.get("COURSES_FILE", ""))
 
-        # Boat type + matching stack panel
+        # Boat type — restrict to the algorithm's compatible types, then restore.
+        self._populate_boat_types()
         bt = c.get("BOAT_TYPE", "direct_power_method")
         idx = self.boat_type.findData(bt)
-        idx = idx if idx >= 0 else 0
+        if idx < 0:
+            idx = 0
         self.boat_type.setCurrentIndex(idx)
-        self.stack.setCurrentIndex(idx)
+        self.stack.setCurrentIndex(_BOAT_STACK.get(self.boat_type.currentData(), 0))
+        self._apply_speed_visibility()
         self._update_status()

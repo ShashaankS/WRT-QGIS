@@ -3,8 +3,8 @@ from qgis.PyQt.QtWidgets import (
     QWizardPage, QVBoxLayout, QLabel, QCheckBox, QGroupBox
 )
 from qgis.PyQt.QtCore import Qt
-from .defaults import CONSTRAINT_OPTIONS
-from .ui_kit import StatusLine, page_header
+from ..core.defaults import CONSTRAINT_OPTIONS
+from ..ui.ui_kit import StatusLine, page_header
 
 DEFAULT_CONSTRAINTS = ["land_crossing_global_land_mask", "water_depth", "on_map"]
 

@@ -4,9 +4,6 @@ All values are drawn from the official WRT documentation:
 https://52north.github.io/WeatherRoutingTool/source/configuration.html
 """
 
-# Knots -> metres/second (1 knot = 1852 m / 3600 s).
-KNOTS_TO_MS = 0.514444
-
 DEFAULTS = {
     # --- Route (Page 1) ---
     "DEFAULT_MAP": "",          # bbox lat_min,lon_min,lat_max,lon_max  (derived from route if blank)
@@ -20,7 +17,7 @@ DEFAULTS = {
     "BOAT_LENGTH": "",
     "BOAT_BREADTH": "",
     "BOAT_TYPE": "direct_power_method",
-    "BOAT_SPEED": 12.0,         # knots stored, converted to m/s on export
+    "BOAT_SPEED": 5.0,         # m/s
     "BOAT_FUEL_RATE": "",
     "BOAT_HBR": "",
     "BOAT_SMCR_POWER": "",
@@ -96,12 +93,18 @@ DEFAULTS = {
 
     # --- Constraints (Page 5) ---
     "CONSTRAINTS_LIST": ["land_crossing_global_land_mask", "water_depth", "on_map"],
+
+    # --- Wizard-internal state (genetic)) ---
+    "_GENETIC_INTENT": "speed_waypoints",   # waypoints | speed_waypoints | speed
+    "_GENETIC_SCHEDULE": "via_speed",        # via_speed | via_arrival (waypoints-only mode)
 }
+
+# Wizard-internal keys never written to the exported config.json.
+INTERNAL_KEYS = {"_GENETIC_INTENT", "_GENETIC_SCHEDULE"}
 
 BOAT_TYPE_OPTIONS = [
     ("direct_power_method", "Direct power method"),
     ("CBT", "CBT (maripower)"),
-    ("SAL", "SAL (maripower)"),
     ("speedy_isobased", "Speedy isobased (testing only)"),
 ]
 
@@ -163,3 +166,50 @@ GENETIC_CROSSOVER_PATCHER_OPTIONS = [
     ("isofuel", "Isofuel (default)"),
     ("gcr", "GCR"),
 ]
+
+# Full algorithm list shown on Page 2.
+ALGORITHM_OPTIONS = [
+    ("isofuel", "Isofuel (default)"),
+    ("genetic", "Genetic"),
+    ("gcr_slider", "GCR Slider"),
+    ("dijkstra", "Dijkstra"),
+    ("genetic_shortest_route", "Genetic (shortest route)"),
+    ("speedy_isobased", "Speedy isobased (testing only)"),
+]
+
+# Optimisation intent for the genetic algorithm.
+GENETIC_INTENT_OPTIONS = [
+    ("waypoints", "Waypoints only (constant speed)"),
+    ("speed_waypoints", "Speed + waypoints"),
+    ("speed", "Speed only (not yet implemented)"),
+]
+
+# Mutation types valid in each intent. The full GENETIC_MUTATION_OPTIONS list is
+# used for the mixed (speed + waypoints) mode.
+GENETIC_MUTATION_WAYPOINT_OPTIONS = [
+    ("waypoints", "Waypoints"),
+    ("rndm_walk", "Random walk"),
+    ("rndm_plateau", "Random plateau"),
+    ("route_blend", "Route blend"),
+    ("no_mutation", "No mutation"),
+]
+
+GENETIC_MUTATION_SPEED_OPTIONS = [
+    ("speed", "Speed"),
+    ("percentage_change_speed", "Percentage change speed"),
+    ("gaussian_speed", "Gaussian speed"),
+]
+
+# Crossover type forced by each intent.
+GENETIC_INTENT_CROSSOVER = {
+    "waypoints": "waypoints",
+    "speed_waypoints": "random",
+    "speed": "speed",
+}
+
+# Algorithm -> compatible boat types.
+ALGO_BOAT_COMPAT = {
+    "speedy_isobased": ["speedy_isobased"],
+    "genetic_shortest_route": ["speedy_isobased"],
+}
+ALGO_BOAT_COMPAT_DEFAULT = ["direct_power_method", "CBT"]

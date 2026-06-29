@@ -1,4 +1,7 @@
-"""Main QWizard — assembles all 6 pages with sidebar nav and progress bar."""
+"""Main QWizard — assembles all 6 pages with sidebar nav and progress bar.
+
+Page order: Route → Algorithm → Boat → Weather & Depth → Constraints → Review.
+"""
 import copy
 
 from qgis.core import Qgis, QgsMessageLog
@@ -15,17 +18,17 @@ from qgis.PyQt.QtWidgets import (
     QWizard,
 )
 
-from .defaults import DEFAULTS
+from ..core.defaults import DEFAULTS
 from .ui_kit import (
     COLOR_BORDER, COLOR_GRAY_BADGE, COLOR_MUTED, COLOR_PRIMARY,
     COLOR_PRIMARY_SOFT, COLOR_SIDEBAR_BG, COLOR_TEXT, GLOBAL_QSS,
 )
-from .page1_route import RoutePage
-from .page2_boat import BoatPage
-from .page3_weather import WeatherPage
-from .page4_algorithm import AlgorithmPage
-from .page5_constraints import ConstraintsPage
-from .page6_review import ReviewPage
+from ..pages.page1_route import RoutePage
+from ..pages.page2_algorithm import AlgorithmPage
+from ..pages.page3_boat import BoatPage
+from ..pages.page4_weather import WeatherPage
+from ..pages.page5_constraints import ConstraintsPage
+from ..pages.page6_review import ReviewPage
 
 
 class _StepRow(QFrame):
@@ -154,6 +157,13 @@ class WRTConfigWizard(QWizard):
         self.setStyleSheet(
             "QWizard, QWizardPage { background: #ffffff; }"
             "QWidget#qt_wizard_titlelabel, QWidget#qt_wizard_subtitlelabel { background: #ffffff; }"
+            "QPushButton:default:disabled {"
+            "  background: #f3f4f6;"
+            "  color: #9ca3af;"
+            "  border: 1px solid #d1d5db;"
+            "  font-weight: normal;"
+            "  cursor: forbidden;"
+            "}"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setOption(QWizard.NoBackButtonOnStartPage, True)
@@ -170,11 +180,11 @@ class WRTConfigWizard(QWizard):
         self._skip_validation = False
 
         # Build pages
-        self.page1 = RoutePage(self.config, self)
-        self.page2 = BoatPage(self.config)
-        self.page3 = WeatherPage(self.config)
-        self.page4 = AlgorithmPage(self.config)
-        self.page5 = ConstraintsPage(self.config)
+        self.page1 = RoutePage(self.config, self)      # Route
+        self.page2 = AlgorithmPage(self.config)        # Algorithm
+        self.page3 = BoatPage(self.config)             # Boat
+        self.page4 = WeatherPage(self.config)          # Weather & Depth
+        self.page5 = ConstraintsPage(self.config)      # Constraints
 
         data_pages = [self.page1, self.page2, self.page3, self.page4, self.page5]
         self.page6 = ReviewPage(self.config, data_pages)
@@ -285,9 +295,9 @@ class WRTConfigWindow(QDialog):
         self.sidebar = _StepSidebar(
             [
                 "Route",
-                "Boat Config",
+                "Algorithm",
+                "Boat Details",
                 "Weather & Depth",
-                "Algorithm Selection",
                 "Constraints",
                 "Review & Export",
             ],

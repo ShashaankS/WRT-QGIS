@@ -65,7 +65,7 @@ QComboBox QAbstractItemView {{
 QGroupBox {{
     border: 1px solid {COLOR_BORDER};
     border-radius: 10px;
-    margin-top: 16px;
+    margin-top: 10px;
     padding: 16px 14px 12px 14px;
     font-weight: 600;
     color: {COLOR_TEXT};

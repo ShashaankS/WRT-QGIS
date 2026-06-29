@@ -1,4 +1,4 @@
-"""Page 3 — Weather & depth datasets: file paths, time params, and NetCDF validation."""
+"""Page 4 — Weather & depth datasets: file paths, time params, and NetCDF validation."""
 import os
 import re
 from datetime import datetime, timedelta
@@ -9,18 +9,12 @@ from qgis.PyQt.QtWidgets import (
     QFileDialog
 )
 from qgis.PyQt.QtCore import Qt
-from .ui_kit import (
-    COLOR_FILE_ERROR, COLOR_FILE_OK, COLOR_MUTED, StatusLine, join_terms,
+from osgeo import gdal, osr
+
+from ..ui.ui_kit import (
+    COLOR_FILE_ERROR, COLOR_FILE_OK, COLOR_MUTED, COLOR_WARNING, StatusLine,
     opt_label, page_header,
 )
-
-# NetCDF inspection via GDAL
-try:
-    from osgeo import gdal
-    gdal.UseExceptions()
-    _HAS_GDAL = True
-except ImportError:
-    _HAS_GDAL = False
 
 UNIT_SECONDS = {
     "seconds": 1, "second": 1, "secs": 1, "sec": 1, "s": 1,
@@ -51,97 +45,153 @@ def parse_time_units(units):
             continue
     return None
 
+def _datasets(path):
+    """Open a file and yield a gdal dataset per geospatial variable.
 
-def spatial_extent(ds):
-    """Return (lat_min, lat_max, lon_min, lon_max) from a GDAL dataset's geotransform."""
-    gt = ds.GetGeoTransform()
-    nx, ny = ds.RasterXSize, ds.RasterYSize
-    if not gt or nx == 0 or ny == 0:
-        return None
-    lon_a = gt[0]
-    lon_b = gt[0] + gt[1] * nx
-    lat_a = gt[3]
-    lat_b = gt[3] + gt[5] * ny
-    return (min(lat_a, lat_b), max(lat_a, lat_b), min(lon_a, lon_b), max(lon_a, lon_b))
-
-
-def time_range(metadata):
-    """Find a NetCDF time dimension in GDAL metadata and return (min_dt, max_dt).
-
-    Handles any time-axis name ('time', 'valid_time', …). Returns None if absent
-    or unparseable.
+    NetCDF variables are exposed as GDAL subdatasets (NETCDF:"file":var); a
+    plain raster has none, so the root dataset itself is yielded.
+    
+    :raises ValueError: if the file cannot be opened by GDAL at all.
     """
-    for key, raw in metadata.items():
-        m = re.match(r"NETCDF_DIM_(.+)_VALUES$", key)
-        if not m:
+    def _open(name):
+        # GDAL <4 returns None on failure; GDAL 4 / UseExceptions() raises.
+        try:
+            return gdal.Open(name)
+        except RuntimeError:
+            return None
+
+    gdal.PushErrorHandler("CPLQuietErrorHandler")
+    try:
+        root = _open(path)
+        if root is None:
+            raise ValueError("not a readable NetCDF/raster file")
+        subs = root.GetSubDatasets()
+        if not subs:
+            yield root
+            return
+        for name, _desc in subs:
+            ds = _open(name)
+            if ds is not None:
+                yield ds
+    finally:
+        gdal.PopErrorHandler()
+
+def spatial_extent(ds, gt):
+    """Return ((lat_min, lon_min, lat_max, lon_max), (dx, dy)) for a dataset.
+
+    The extent is shrunk by half a cell so it describes the grid's cell-CENTRE
+    coverage — the region where values can actually be interpolated — rather
+    than GDAL's pixel-edge bounds. Coordinates are reprojected to WGS84 when the
+    dataset declares a non-geographic CRS; NetCDF grids 
+    usually carry none, in which case the raw lon/lat degrees are used as-is.
+    """
+    nx, ny = ds.RasterXSize, ds.RasterYSize
+    dx, dy = abs(gt[1]), abs(gt[5])
+    # Pixel-edge corners from the geotransform, then pull in half a cell.
+    xs = sorted((gt[0], gt[0] + gt[1] * nx))
+    ys = sorted((gt[3], gt[3] + gt[5] * ny))
+    lon_min, lon_max = xs[0] + dx / 2, xs[1] - dx / 2
+    lat_min, lat_max = ys[0] + dy / 2, ys[1] - dy / 2
+
+    wkt = ds.GetProjection()
+    if wkt:
+        src = osr.SpatialReference()
+        src.ImportFromWkt(wkt)
+        if not src.IsGeographic():
+            dst = osr.SpatialReference()
+            dst.ImportFromEPSG(4326)
+            dst.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            src.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            tr = osr.CoordinateTransformation(src, dst)
+            corners = [tr.TransformPoint(x, y)[:2]
+                       for x in (lon_min, lon_max) for y in (lat_min, lat_max)]
+            lons = [c[0] for c in corners]
+            lats = [c[1] for c in corners]
+            lon_min, lon_max = min(lons), max(lons)
+            lat_min, lat_max = min(lats), max(lats)
+    return (lat_min, lon_min, lat_max, lon_max), (dx, dy)
+
+def time_axis(ds):
+    """Return (sorted_timestamps, calendar) for a dataset's CF time dimension.
+
+    Reads the canonical GDAL metadata (`<dim>#units`, `<dim>#calendar`,
+    `NETCDF_DIM_<dim>_VALUES`) rather than parsing per-band label strings, so it
+    sees the full axis in order. Returns None if the dataset has no parseable
+    time dimension (e.g. static bathymetry).
+    """
+    md = ds.GetMetadata()
+    for key, units in md.items():
+        if not key.endswith("#units") or "since" not in units.lower():
             continue
-        dim = m.group(1)
-        units = metadata.get(f"{dim}#units", "")
-        if "since" not in units.lower():
-            continue
+        dim = key[:-len("#units")]
+        raw = md.get("NETCDF_DIM_%s_VALUES" % dim)
         parsed = parse_time_units(units)
-        if not parsed:
+        if not raw or not parsed:
             continue
         per_unit, ref = parsed
-        nums = re.findall(r"-?\d+(?:\.\d+)?", raw)
-        if not nums:
+        try:
+            values = [float(v) for v in raw.strip("{} ").split(",") if v.strip()]
+        except ValueError:
             continue
-        vals = [float(n) for n in nums]
-        lo = ref + timedelta(seconds=min(vals) * per_unit)
-        hi = ref + timedelta(seconds=max(vals) * per_unit)
-        return (lo, hi)
+        if not values:
+            continue
+        stamps = sorted(ref + timedelta(seconds=v * per_unit) for v in values)
+        calendar = md.get("%s#calendar" % dim, "").lower()
+        return stamps, calendar
     return None
+
+def median_step_hours(stamps):
+    """Median spacing between consecutive timestamps, in hours (None if <2)."""
+    diffs = sorted((stamps[i + 1] - stamps[i]).total_seconds()
+                   for i in range(len(stamps) - 1))
+    diffs = [d for d in diffs if d > 0]
+    if not diffs:
+        return None
+    mid = len(diffs) // 2
+    med = diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2
+    return med / 3600.0
 
 
 def inspect_netcdf(path):
-    """Inspect a NetCDF file via GDAL.
+    """Inspect a NetCDF file's spatial extent and time dimension via GDAL.
 
-    :return: dict with 'extent' (lat_min, lat_max, lon_min, lon_max)
-             and optional 'time' (min_dt, max_dt).
+    :return: dict with 'extent' (lat_min, lon_min, lat_max, lon_max), 'cell'
+             (dx, dy in degrees) and, when a time axis is present, 'time'
+             (min_dt, max_dt), 'time_step_hours' and 'calendar'.
     :raises ValueError: if the file cannot be opened or has no geospatial grid.
     """
-    ds = gdal.Open(path)
-    if ds is None:
-        raise ValueError("not a readable NetCDF/raster file")
-    try:
-        subs = ds.GetSubDatasets()
-        # NetCDF variables are exposed as subdatasets; pick the first usable grid.
-        candidates = [s[0] for s in subs] if subs else [None]
-        metadata = dict(ds.GetMetadata())
-        extent = None
-        for name in candidates:
-            cand = gdal.Open(name) if name else ds
-            if cand is None:
-                continue
-            try:
-                ext = spatial_extent(cand)
-                if ext:
-                    extent = ext
-                    metadata.update(cand.GetMetadata())
-                    break
-            finally:
-                if name is not None:
-                    cand = None  # release the subdataset handle
+    extent = cell = time_info = None
+    for ds in _datasets(path):
+        gt = ds.GetGeoTransform(can_return_null=True)
+        if gt is None or ds.RasterXSize < 2 or ds.RasterYSize < 2:
+            continue  # non-spatial variable (time_bnds, crs, …)
         if extent is None:
-            raise ValueError("no geospatial grid found (missing latitude/longitude)")
+            extent, cell = spatial_extent(ds, gt)
+        if time_info is None:
+            time_info = time_axis(ds)
+        if extent is not None and time_info is not None:
+            break
 
-        info = {"extent": extent}
-        trange = time_range(metadata)
-        if trange:
-            info["time"] = trange
-        return info
-    finally:
-        ds = None  # release the file handle promptly
+    if extent is None:
+        raise ValueError("no geospatial grid found (missing latitude/longitude)")
+
+    info = {"extent": extent, "cell": cell}
+    if time_info:
+        stamps, calendar = time_info
+        info["time"] = (stamps[0], stamps[-1])
+        info["time_step_hours"] = median_step_hours(stamps)
+        info["calendar"] = calendar
+    return info
 
 
 def lon_within(e_lon_min, e_lon_max, lon):
     """True if a WGS84 longitude falls in [e_lon_min, e_lon_max] under either the
-    -180..180 or 0..360 convention (datasets like ERA5/GFS use 0..360)."""
+    -180..180 or 0..360 convention."""
     return any(e_lon_min <= cand <= e_lon_max for cand in (lon, lon + 360, lon - 360))
 
 
 def _covers(extent, lat_min, lon_min, lat_max, lon_max):
-    e_lat_min, e_lat_max, e_lon_min, e_lon_max = extent
+    e_lat_min, e_lon_min, e_lat_max, e_lon_max = extent
     return (e_lat_min <= lat_min <= e_lat_max and
             e_lat_min <= lat_max <= e_lat_max and
             lon_within(e_lon_min, e_lon_max, lon_min) and
@@ -303,12 +353,6 @@ class WeatherPage(QWizardPage):
 
         size_mb = os.path.getsize(path) / (1024 * 1024)
 
-        if not _HAS_GDAL:
-            return (True,
-                    f"✓  {os.path.basename(path)}  —  {size_mb:.0f} MB"
-                    "  (GDAL unavailable — coverage not checked)",
-                    COLOR_FILE_OK, True)
-
         try:
             info = inspect_netcdf(path)
         except Exception as e:
@@ -316,12 +360,13 @@ class WeatherPage(QWizardPage):
 
         extent = info["extent"]
         checks = []
+        warns = []
 
         map_coords = self._parse_map_coords()
         if map_coords:
             lat_min, lon_min, lat_max, lon_max = map_coords
             if not _covers(extent, lat_min, lon_min, lat_max, lon_max):
-                e_lat_min, e_lat_max, e_lon_min, e_lon_max = extent
+                e_lat_min, e_lon_min, e_lat_max, e_lon_max = extent
                 return (False,
                         f"✗  Spatial coverage [{e_lat_min:.2f}°, {e_lon_min:.2f}°, "
                         f"{e_lat_max:.2f}°, {e_lon_max:.2f}°] does not cover "
@@ -347,9 +392,10 @@ class WeatherPage(QWizardPage):
                 checks.append("time ✓")
 
         detail = "  ".join(checks) if checks else "structure OK"
-        return (True,
-                f"✓  {os.path.basename(path)}  —  {size_mb:.0f} MB  —  {detail}",
-                COLOR_FILE_OK, True)
+        base = f"✓  {os.path.basename(path)}  —  {size_mb:.0f} MB  —  {detail}"
+        if warns:
+            return (True, base + "    ⚠ " + "; ".join(warns), COLOR_WARNING, True)
+        return (True, base, COLOR_FILE_OK, True)
 
     def _validate_weather(self, path):
         state, text, color, bold = self._validate(path, require_time=True)
@@ -359,6 +405,12 @@ class WeatherPage(QWizardPage):
         self.completeChanged.emit()
 
     def _validate_depth(self, path):
+        if not path:
+            self._depth_valid = None
+            self.depth_field.set_status("Optional — leave blank to skip", COLOR_MUTED, False)
+            self._update_status()
+            self.completeChanged.emit()
+            return
         state, text, color, bold = self._validate(path, require_time=False)
         self._depth_valid = state
         self.depth_field.set_status(text, color, bold)
@@ -368,15 +420,17 @@ class WeatherPage(QWizardPage):
     def _update_status(self):
         if self.status is None:
             return  # still being constructed
-        if self._weather_valid is True and self._depth_valid is True:
-            self.status.set_ok("Weather & depth datasets validated")
+        depth_ok = self._depth_valid is True or self._depth_valid is None
+        if self._weather_valid is True and depth_ok:
+            if self._depth_valid is True:
+                self.status.set_ok("Weather & depth datasets validated")
+            else:
+                self.status.set_ok("Weather dataset validated (no bathymetry)")
             return
-        need = []
         if self._weather_valid is not True:
-            need.append("valid weather data")
-        if self._depth_valid is not True:
-            need.append("valid depth data")
-        self.status.set_pending("Provide " + join_terms(need) + " to continue")
+            self.status.set_pending("Provide valid weather data to continue")
+        else:
+            self.status.set_pending("Bathymetry file provided but invalid — fix or clear it to continue")
 
     def _on_weather_changed(self, text):
         self._validate_weather(text.strip())
@@ -385,7 +439,8 @@ class WeatherPage(QWizardPage):
         self._validate_depth(text.strip())
 
     def isComplete(self):
-        return self._weather_valid is True and self._depth_valid is True
+        depth_ok = self._depth_valid is True or self._depth_valid is None
+        return self._weather_valid is True and depth_ok
 
     # Config persistence
     def save_to_config(self):

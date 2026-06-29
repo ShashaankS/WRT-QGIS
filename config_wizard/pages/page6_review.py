@@ -7,23 +7,82 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtCore import Qt
-from .ui_kit import StatusLine, join_terms, page_header
+from ..core.defaults import INTERNAL_KEYS
+from ..ui.ui_kit import StatusLine, join_terms, page_header
 
+# Keys from WRT config.py valid for all algorithms.
+_UNIVERSAL_KEYS = frozenset({
+    "ALGORITHM_TYPE", "ARRIVAL_TIME", "BOAT_TYPE", "BOAT_SPEED",
+    "BOAT_SPEED_BOUNDARIES", "CONSTRAINTS_LIST", "DEFAULT_MAP", "DEFAULT_ROUTE",
+    "DELTA_FUEL", "DELTA_TIME_FORECAST", "DEPARTURE_TIME", "INTERMEDIATE_WAYPOINTS",
+    "ROUTER_HDGS_INCREMENTS_DEG", "ROUTER_HDGS_SEGMENTS", "ROUTE_PATH",
+    "ROUTE_POSTPROCESSING", "ROUTING_STEPS", "TIME_FORECAST",
+    "COURSES_FILE", "DEPTH_DATA", "WEATHER_DATA",
+})
+
+# Extra keys only meaningful for a specific algorithm.
+_ALGO_KEYS = {
+    "dijkstra": frozenset({
+        "DIJKSTRA_MASK_FILE", "DIJKSTRA_NOF_NEIGHBORS", "DIJKSTRA_STEP",
+    }),
+    "gcr_slider": frozenset({
+        "GCR_SLIDER_ANGLE_STEP", "GCR_SLIDER_DISTANCE_MOVE",
+        "GCR_SLIDER_DYNAMIC_PARAMETERS", "GCR_SLIDER_INTERPOLATE",
+        "GCR_SLIDER_INTERP_DIST", "GCR_SLIDER_INTERP_NORMALIZED",
+        "GCR_SLIDER_LAND_BUFFER", "GCR_SLIDER_MAX_POINTS", "GCR_SLIDER_THRESHOLD",
+    }),
+    "genetic": frozenset({
+        "GENETIC_CROSSOVER_PATCHER", "GENETIC_CROSSOVER_TYPE", "GENETIC_FIX_RANDOM_SEED",
+        "GENETIC_MUTATION_TYPE", "GENETIC_NUMBER_GENERATIONS", "GENETIC_NUMBER_OFFSPRINGS",
+        "GENETIC_OBJECTIVES", "GENETIC_POPULATION_PATH", "GENETIC_POPULATION_SIZE",
+        "GENETIC_POPULATION_TYPE", "GENETIC_REPAIR_TYPE",
+    }),
+    "isofuel": frozenset({
+        "ISOCHRONE_MAX_ROUTING_STEPS", "ISOCHRONE_MINIMISATION_CRITERION",
+        "ISOCHRONE_NUMBER_OF_ROUTES", "ISOCHRONE_PRUNE_GROUPS",
+        "ISOCHRONE_PRUNE_SECTOR_DEG_HALF", "ISOCHRONE_PRUNE_SEGMENTS",
+        "ISOCHRONE_PRUNE_SYMMETRY_AXIS",
+    }),
+}
+_ALGO_KEYS["genetic_shortest_route"] = _ALGO_KEYS["genetic"]
+_ALGO_KEYS["speedy_isobased"] = _ALGO_KEYS["isofuel"]
+
+# These algorithms have no weather/depth data pipeline.
+_NO_WEATHER_ALGOS = frozenset({"dijkstra", "gcr_slider"})
 
 def _build_export(config):
-    """Build the final JSON dict, stripping None/empty optional values."""
+    """Build the WRT-compatible config dict, containing only keys known to config.py."""
+    algo = config.get("ALGORITHM_TYPE", "isofuel")
+    allowed = _UNIVERSAL_KEYS | _ALGO_KEYS.get(algo, frozenset())
+
+    drop = set(INTERNAL_KEYS)
+    # dijkstra/gcr_slider have no weather/depth pipeline.
+    if algo in _NO_WEATHER_ALGOS:
+        drop |= {"WEATHER_DATA", "DEPTH_DATA", "DELTA_TIME_FORECAST", "TIME_FORECAST"}
+    # Genetic waypoints-only: exactly one of BOAT_SPEED/ARRIVAL_TIME is used.
+    if algo == "genetic" and config.get("_GENETIC_INTENT") == "waypoints":
+        if config.get("_GENETIC_SCHEDULE") == "via_arrival":
+            drop.add("BOAT_SPEED")
+        else:
+            drop.add("ARRIVAL_TIME")
+
     out = {}
-    skip_if_empty = {
-        "ARRIVAL_TIME", "COURSES_FILE", "DIJKSTRA_MASK_FILE",
-        "GENETIC_POPULATION_PATH", "BOAT_SPEED_MAX",
-        "BOAT_AOD","BOAT_AXV","BOAT_AYV","BOAT_CMC","BOAT_HC",
-        "BOAT_BS1","BOAT_HS1","BOAT_HS2","BOAT_LS1","BOAT_LS2",
-    }
-    for key, val in config.items():
-        if val is None:
+    for key in allowed:
+        if key in drop:
             continue
-        if key in skip_if_empty and (val == "" or val == 0):
+        val = config.get(key)
+        if val is None or val == "" or val == []:
             continue
+        # config.py expects DEFAULT_ROUTE / DEFAULT_MAP as a list of 4 floats.
+        if key in ("DEFAULT_ROUTE", "DEFAULT_MAP") and isinstance(val, str):
+            try:
+                val = [float(x.strip()) for x in val.split(",")]
+            except (ValueError, AttributeError):
+                continue
+        # config.py expects GENETIC_REPAIR_TYPE as List[str], not a bare string.
+        if key == "GENETIC_REPAIR_TYPE" and isinstance(val, str):
+            val = [val]
+        # Compact whole-number floats to int for cleaner JSON.
         if isinstance(val, float) and val == int(val):
             val = int(val)
         out[key] = val
@@ -88,8 +147,8 @@ class ReviewPage(QWizardPage):
         root.addWidget(self.status)
 
     STEP_NAMES = [
-        "Route", "Boat configuration", "Weather & depth",
-        "Algorithm", "Constraints",
+        "Route", "Algorithm", "Boat Details",
+        "Weather & depth", "Constraints",
     ]
 
     def _update_status(self):

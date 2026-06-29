@@ -1,28 +1,21 @@
-"""Page 4 — Algorithm selection and tuning parameters."""
+"""Page 2 — Algorithm selection & parameters.
+
+The algorithm is chosen on this page; the parameter panel below switches to
+match the selection.
+"""
 from qgis.PyQt.QtWidgets import (
     QWizardPage, QVBoxLayout, QFormLayout, QLabel, QComboBox,
     QGroupBox, QCheckBox, QScrollArea, QWidget,
     QHBoxLayout, QLineEdit, QPushButton, QFileDialog, QStackedWidget,
+    QDateTimeEdit,
 )
-from qgis.PyQt.QtCore import Qt
-from .ui_kit import (
-    COLOR_MUTED, COLOR_WARNING, StatusLine, collapsible, dspin, ispin,
-    opt_label, page_header,
+from qgis.PyQt.QtCore import Qt, QDateTime
+from ..ui.ui_kit import (
+    COLOR_MUTED, COLOR_WARNING, StatusLine, collapsible, dspin, field_label,
+    ispin, opt_label, page_header,
 )
 
-# Algorithms grouped by required boat type.
-_NORMAL_BOAT_ALGOS = [
-    ("isofuel", "Isofuel (default)"),
-    ("genetic", "Genetic algorithm"),
-    ("gcr_slider", "GCR Slider"),
-    ("dijkstra", "Dijkstra"),
-]
-_SPEEDY_BOAT_ALGOS = [
-    ("speedy_isobased", "Speedy isobased (testing only)"),
-    ("genetic_shortest_route", "Genetic (shortest route)"),
-]
-
-# Fixed stack position for each algorithm — independent of combo order.
+# Fixed stack position for each algorithm.
 _ALGO_STACK = {
     "isofuel": 0,
     "genetic": 1,
@@ -32,11 +25,34 @@ _ALGO_STACK = {
     "speedy_isobased": 5,
 }
 
-from .defaults import (
-    MINIMISATION_OPTIONS, PRUNE_GROUP_OPTIONS,
+from ..core.defaults import (
+    ALGORITHM_OPTIONS, MINIMISATION_OPTIONS, PRUNE_GROUP_OPTIONS,
     SYMMETRY_AXIS_OPTIONS, GENETIC_POPULATION_OPTIONS, GENETIC_MUTATION_OPTIONS,
-    GENETIC_CROSSOVER_OPTIONS, GENETIC_REPAIR_OPTIONS, GENETIC_CROSSOVER_PATCHER_OPTIONS
+    GENETIC_CROSSOVER_PATCHER_OPTIONS, GENETIC_REPAIR_OPTIONS,
+    GENETIC_INTENT_OPTIONS, GENETIC_INTENT_CROSSOVER,
+    GENETIC_MUTATION_WAYPOINT_OPTIONS, GENETIC_MUTATION_SPEED_OPTIONS,
 )
+
+_ALGO_LABELS = dict(ALGORITHM_OPTIONS)
+
+_ALGO_DESCRIPTIONS = {
+    "isofuel": "Isochrone-based fuel optimisation over waypoints.",
+    "genetic": "Multi-objective optimisation of waypoints and/or speed (fuel & arrival-time accuracy).",
+    "gcr_slider": "Great-circle-route slider optimising distance.",
+    "dijkstra": "Graph shortest-path optimising distance.",
+    "genetic_shortest_route": "Genetic optimisation of the shortest route using the speedy-isobased boat model.",
+    "speedy_isobased": "Testing-only isobased model using a constant speed.",
+}
+
+_INTENT_DESCRIPTIONS = {
+    "waypoints": "Optimise the route geometry at a fixed schedule. Crossover and "
+                 "mutation are restricted to waypoint operators; only fuel "
+                 "consumption is optimised.",
+    "speed_waypoints": "Optimise both the route geometry and the speed profile. "
+                       "Fuel consumption and/or arrival-time accuracy can be weighted.",
+    "speed": "Optimise only the speed profile on a fixed route. Not yet "
+             "implemented in the routing tool.",
+}
 
 
 def _combo(options):
@@ -74,23 +90,25 @@ class AlgorithmPage(QWizardPage):
         sw.addWidget(self.status)
         outer.addWidget(status_wrap)
 
-        root.addWidget(page_header(
-            "Algorithm selection",
-            "Choose the routing algorithm and tune its parameters.",
-        ))
+        self.header_lbl = page_header(
+            "Routing algorithm",
+            "Choose a algorithm, its optimisation goal, then tune its parameters.",
+        )
+        root.addWidget(self.header_lbl)
 
         # Algorithm picker
-        pick_box = QGroupBox("Algorithm type")
-        pick_form = QFormLayout(pick_box)
-        pick_form.setLabelAlignment(Qt.AlignRight)
-        # Combo is populated dynamically in initializePage based on boat type.
+        root.addWidget(field_label("Choose an algorithm"))
         self.algo_combo = QComboBox()
+        for val, lbl in ALGORITHM_OPTIONS:
+            self.algo_combo.addItem(lbl, val)
         self.algo_combo.currentIndexChanged.connect(self._on_algo_changed)
-        pick_form.addRow(opt_label("Algorithm", "ALGORITHM_TYPE"), self.algo_combo)
-        root.addWidget(pick_box)
+        root.addWidget(self.algo_combo)
+        self.algo_desc = QLabel()
+        self.algo_desc.setWordWrap(True)
+        self.algo_desc.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+        root.addWidget(self.algo_desc)
 
-        # Stacked param panels
-        # Order is fixed and matches _ALGO_STACK indices.
+        # Stacked param panels — order matches _ALGO_STACK indices.
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_isofuel_page())           # 0
         self.stack.addWidget(self._build_genetic_page())           # 1
@@ -145,45 +163,129 @@ class AlgorithmPage(QWizardPage):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
 
+        # Intent selector — 
+        # 1. Waypoints-only
+        # 2. Speed & waypoints
+        # 3. Speed-only — not yet implemented.
+        
+        v.addWidget(field_label("Optimization Options"))
+        self.gen_intent = QComboBox()
+        for val, lbl in GENETIC_INTENT_OPTIONS:
+            self.gen_intent.addItem(lbl, val)
+        # "Speed only" is not yet implemented — show but disable it.
+        speed_idx = self.gen_intent.findData("speed")
+        if speed_idx >= 0:
+            self.gen_intent.model().item(speed_idx).setEnabled(False)
+        self.gen_intent.currentIndexChanged.connect(self._refresh_genetic_visibility)
+        v.addWidget(self.gen_intent)
+        self.gen_intent_desc = QLabel()
+        self.gen_intent_desc.setWordWrap(True)
+        self.gen_intent_desc.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+        v.addWidget(self.gen_intent_desc)
+
+        # Required parameters
         req = QGroupBox("Required parameters")
-        form = QFormLayout(req)
-        form.setLabelAlignment(Qt.AlignRight)
-        form.setSpacing(8)
+        req_form = QFormLayout(req)
+        req_form.setLabelAlignment(Qt.AlignRight)
+        req_form.setSpacing(8)
         self.gen_generations = ispin(val=20, mn=1)
-        self.gen_obj_arrival = dspin(val=1.5, mn=0, mx=100, dec=2)
-        self.gen_obj_fuel = dspin(val=1.5, mn=0, mx=100, dec=2)
-        form.addRow(opt_label("Generations", "GENETIC_NUMBER_GENERATIONS"), self.gen_generations)
-        form.addRow(QLabel("<b>Objective weights</b> (GENETIC_OBJECTIVES)"))
-        form.addRow(opt_label("  Arrival time weight"), self.gen_obj_arrival)
-        form.addRow(opt_label("  Fuel consumption weight"), self.gen_obj_fuel)
+        req_form.addRow(opt_label("Generations", "GENETIC_NUMBER_GENERATIONS"), self.gen_generations)
         v.addWidget(req)
 
+        # Objective weights (contextual)
+        self.gen_obj_box = QGroupBox("Objective weights (GENETIC_OBJECTIVES)")
+        obj_form = QFormLayout(self.gen_obj_box)
+        obj_form.setLabelAlignment(Qt.AlignRight)
+        obj_form.setSpacing(8)
+        self.gen_obj_fuel = dspin(val=1.5, mn=0, mx=100, dec=2)
+        self.gen_obj_arrival = dspin(val=1.5, mn=0, mx=100, dec=2)
+        self.gen_obj_fuel_lbl = opt_label("Fuel consumption weight")
+        self.gen_obj_arrival_lbl = opt_label("Arrival-time weight")
+        obj_form.addRow(self.gen_obj_fuel_lbl, self.gen_obj_fuel)
+        obj_form.addRow(self.gen_obj_arrival_lbl, self.gen_obj_arrival)
+        v.addWidget(self.gen_obj_box)
+
+        # Schedule (waypoints-only mode)
+        self.gen_sched_box = QGroupBox("Fix the schedule")
+        sched_v = QVBoxLayout(self.gen_sched_box)
+        sched_v.setSpacing(8)
+        sched_hint = QLabel(
+            "In waypoints-only mode the schedule is fixed either by a constant "
+            "boat speed or by a target arrival time (the other value is left unset)."
+        )
+        sched_hint.setWordWrap(True)
+        sched_hint.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+        sched_v.addWidget(sched_hint)
+        sched_form = QFormLayout()
+        sched_form.setLabelAlignment(Qt.AlignRight)
+        sched_form.setSpacing(8)
+        self.gen_sched = QComboBox()
+        self.gen_sched.addItem("Via speed", "via_speed")
+        self.gen_sched.addItem("Via arrival time", "via_arrival")
+        self.gen_sched.currentIndexChanged.connect(self._refresh_genetic_visibility)
+        sched_form.addRow(opt_label("Fix via"), self.gen_sched)
+        self.gen_sched_speed = dspin(val=6.17, suffix="m/s", mx=60, dec=3)
+        self.gen_sched_speed_lbl = opt_label("Boat speed", "BOAT_SPEED")
+        self.gen_sched_arrival = QDateTimeEdit()
+        self.gen_sched_arrival.setDisplayFormat("dd/MM/yyyy - hh:mm AP")
+        self.gen_sched_arrival.setCalendarPopup(True)
+        self.gen_sched_arrival_lbl = opt_label("Arrival time", "ARRIVAL_TIME")
+        sched_form.addRow(self.gen_sched_speed_lbl, self.gen_sched_speed)
+        sched_form.addRow(self.gen_sched_arrival_lbl, self.gen_sched_arrival)
+        sched_v.addLayout(sched_form)
+        v.addWidget(self.gen_sched_box)
+        
+        # Speed + waypoints: both speed AND arrival time required.
+        self.gen_sw_box = QGroupBox("Speed & arrival time")
+        sw_form = QFormLayout(self.gen_sw_box)
+        sw_form.setLabelAlignment(Qt.AlignRight)
+        sw_form.setSpacing(8)
+        self.gen_sw_speed = dspin(val=6.17, suffix="m/s", mx=60, dec=3)
+        self.gen_sw_arrival = QDateTimeEdit()
+        self.gen_sw_arrival.setDisplayFormat("dd/MM/yyyy - hh:mm AP")
+        self.gen_sw_arrival.setCalendarPopup(True)
+        sw_form.addRow(opt_label("Boat speed", "BOAT_SPEED"), self.gen_sw_speed)
+        sw_form.addRow(opt_label("Arrival time", "ARRIVAL_TIME"), self.gen_sw_arrival)
+        v.addWidget(self.gen_sw_box)
+
+        # Speed only: just speed.
+        self.gen_s_box = QGroupBox("Speed")
+        s_form = QFormLayout(self.gen_s_box)
+        s_form.setLabelAlignment(Qt.AlignRight)
+        s_form.setSpacing(8)
+        self.gen_s_speed = dspin(val=6.17, suffix="m/s", mx=60, dec=3)
+        s_form.addRow(opt_label("Boat speed", "BOAT_SPEED"), self.gen_s_speed)
+        v.addWidget(self.gen_s_box)
+
+        # Advanced parameters
         btn, box = collapsible("Advanced parameters")
         adv = QFormLayout(box)
         adv.setLabelAlignment(Qt.AlignRight)
         adv.setSpacing(8)
         self.gen_offsprings = ispin(val=2, mn=1)
         self.gen_pop_size = ispin(val=20, mn=2)
+        self.gen_mutation = QComboBox()  # populated per-intent in _refresh_genetic_visibility
         self.gen_pop_type = _combo(GENETIC_POPULATION_OPTIONS)
+        self.gen_pop_type.currentIndexChanged.connect(self._refresh_genetic_visibility)
         self.gen_pop_path = QLineEdit()
         self.gen_pop_path.setPlaceholderText("GeoJSON path (only for from_geojson)")
         gen_pop_browse = QPushButton("Browse…")
         gen_pop_browse.clicked.connect(lambda: self._browse(self.gen_pop_path, "GeoJSON (*.geojson *.json)"))
-        pop_path_row = QHBoxLayout()
+        self.gen_pop_path_row = QWidget()
+        pop_path_row = QHBoxLayout(self.gen_pop_path_row)
+        pop_path_row.setContentsMargins(0, 0, 0, 0)
         pop_path_row.addWidget(self.gen_pop_path)
         pop_path_row.addWidget(gen_pop_browse)
+        self.gen_pop_path_lbl = opt_label("Population path (GeoJSON)", "GENETIC_POPULATION_PATH")
         self.gen_repair = _combo(GENETIC_REPAIR_OPTIONS)
-        self.gen_mutation = _combo(GENETIC_MUTATION_OPTIONS)
-        self.gen_crossover = _combo(GENETIC_CROSSOVER_OPTIONS)
         self.gen_crossover_patcher = _combo(GENETIC_CROSSOVER_PATCHER_OPTIONS)
         self.gen_fix_seed = QCheckBox("Fix random seed (GENETIC_FIX_RANDOM_SEED)")
         adv.addRow(opt_label("Offsprings", "GENETIC_NUMBER_OFFSPRINGS"), self.gen_offsprings)
         adv.addRow(opt_label("Population size", "GENETIC_POPULATION_SIZE"), self.gen_pop_size)
-        adv.addRow(opt_label("Population type", "GENETIC_POPULATION_TYPE"), self.gen_pop_type)
-        adv.addRow(opt_label("Population path (GeoJSON)", "GENETIC_POPULATION_PATH"), pop_path_row)
-        adv.addRow(opt_label("Repair strategy", "GENETIC_REPAIR_TYPE"), self.gen_repair)
         adv.addRow(opt_label("Mutation type", "GENETIC_MUTATION_TYPE"), self.gen_mutation)
-        adv.addRow(opt_label("Crossover type", "GENETIC_CROSSOVER_TYPE"), self.gen_crossover)
+        adv.addRow(opt_label("Population type", "GENETIC_POPULATION_TYPE"), self.gen_pop_type)
+        adv.addRow(self.gen_pop_path_lbl, self.gen_pop_path_row)
+        adv.addRow(opt_label("Repair strategy", "GENETIC_REPAIR_TYPE"), self.gen_repair)
         adv.addRow(opt_label("Crossover patcher", "GENETIC_CROSSOVER_PATCHER"), self.gen_crossover_patcher)
         adv.addRow(self.gen_fix_seed)
         v.addWidget(btn)
@@ -259,9 +361,7 @@ class AlgorithmPage(QWizardPage):
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         note = QLabel(
-            "Genetic shortest route optimises for the shortest path using the genetic "
-            "algorithm with a <b>Speedy isobased</b> boat model. "
-            "Configure genetic parameters on the <i>Genetic algorithm</i> panel."
+            "Note: Experimental algorithm, not fully implemented."
         )
         note.setTextFormat(Qt.RichText)
         note.setWordWrap(True)
@@ -283,24 +383,70 @@ class AlgorithmPage(QWizardPage):
 
     # Helpers
 
-    def _populate_algo_combo(self):
-        """Fill the algorithm combo with only the algorithms valid for the current boat type."""
-        boat = self.config.get("BOAT_TYPE", "direct_power_method")
-        options = _SPEEDY_BOAT_ALGOS if boat == "speedy_isobased" else _NORMAL_BOAT_ALGOS
-        self.algo_combo.blockSignals(True)
-        self.algo_combo.clear()
-        for val, lbl in options:
-            self.algo_combo.addItem(lbl, val)
-        self.algo_combo.blockSignals(False)
+    def _on_algo_changed(self, _idx):
+        algo = self.algo_combo.currentData() or "isofuel"
+        self.algo_desc.setText(_ALGO_DESCRIPTIONS.get(algo, ""))
+        self.stack.setCurrentIndex(_ALGO_STACK.get(algo, 0))
+        self._update_status()
+
+    def _current_algo(self):
+        return self.algo_combo.currentData() or "isofuel"
 
     def _update_status(self):
         if self.status is None:
             return  # still being constructed
-        self.status.set_ok(f"Algorithm configured — {self.algo_combo.currentText()}")
+        algo = self._current_algo()
+        label = _ALGO_LABELS.get(algo, algo)
+        self.status.set_ok(f"Algorithm configured — {label}")
 
-    def _on_algo_changed(self, _idx):
-        algo = self.algo_combo.currentData()
-        self.stack.setCurrentIndex(_ALGO_STACK.get(algo, 0))
+    def _set_mutation_options(self, options):
+        current = self.gen_mutation.currentData()
+        self.gen_mutation.blockSignals(True)
+        self.gen_mutation.clear()
+        for val, lbl in options:
+            self.gen_mutation.addItem(lbl, val)
+        idx = self.gen_mutation.findData(current)
+        self.gen_mutation.setCurrentIndex(idx if idx >= 0 else 0)
+        self.gen_mutation.blockSignals(False)
+
+    def _refresh_genetic_visibility(self, *_):
+        intent = self.gen_intent.currentData() or "speed_waypoints"
+        self.gen_intent_desc.setText(_INTENT_DESCRIPTIONS.get(intent, ""))
+
+        # Objectives — show only the keys valid for the intent.
+        show_fuel = intent in ("waypoints", "speed_waypoints")
+        show_arrival = intent in ("speed_waypoints", "speed")
+        self.gen_obj_fuel.setVisible(show_fuel)
+        self.gen_obj_fuel_lbl.setVisible(show_fuel)
+        self.gen_obj_arrival.setVisible(show_arrival)
+        self.gen_obj_arrival_lbl.setVisible(show_arrival)
+
+        # Per-intent schedule / speed sections.
+        is_waypoints = intent == "waypoints"
+        is_sw = intent == "speed_waypoints"
+        is_speed = intent == "speed"
+        self.gen_sched_box.setVisible(is_waypoints)
+        via = self.gen_sched.currentData()
+        self.gen_sched_speed.setVisible(is_waypoints and via == "via_speed")
+        self.gen_sched_speed_lbl.setVisible(is_waypoints and via == "via_speed")
+        self.gen_sched_arrival.setVisible(is_waypoints and via == "via_arrival")
+        self.gen_sched_arrival_lbl.setVisible(is_waypoints and via == "via_arrival")
+        self.gen_sw_box.setVisible(is_sw)
+        self.gen_s_box.setVisible(is_speed)
+
+        # Mutation options restricted to the intent's valid subset.
+        if intent == "waypoints":
+            self._set_mutation_options(GENETIC_MUTATION_WAYPOINT_OPTIONS)
+        elif intent == "speed":
+            self._set_mutation_options(GENETIC_MUTATION_SPEED_OPTIONS)
+        else:
+            self._set_mutation_options(GENETIC_MUTATION_OPTIONS)
+
+        # Population path is only meaningful for the from_geojson population type.
+        from_geojson = self.gen_pop_type.currentData() == "from_geojson"
+        self.gen_pop_path_lbl.setVisible(from_geojson)
+        self.gen_pop_path_row.setVisible(from_geojson)
+
         self._update_status()
 
     def _browse(self, line_edit, file_filter):
@@ -324,19 +470,44 @@ class AlgorithmPage(QWizardPage):
         c["ISOCHRONE_PRUNE_SECTOR_DEG_HALF"] = self.iso_prune_half.value()
         c["ISOCHRONE_PRUNE_SEGMENTS"] = self.iso_prune_segs.value()
         c["ISOCHRONE_PRUNE_SYMMETRY_AXIS"] = self.iso_prune_sym.currentData()
-        # Genetic
+        # Genetic — derive forced params from the optimisation intent.
+        intent = self.gen_intent.currentData() or "speed_waypoints"
+        c["_GENETIC_INTENT"] = intent
         c["GENETIC_NUMBER_GENERATIONS"] = self.gen_generations.value()
-        c["GENETIC_OBJECTIVES"] = {
-            "arrival_time": self.gen_obj_arrival.value(),
-            "fuel_consumption": self.gen_obj_fuel.value(),
-        }
+        c["GENETIC_CROSSOVER_TYPE"] = GENETIC_INTENT_CROSSOVER.get(intent, "random")
+        c["GENETIC_MUTATION_TYPE"] = self.gen_mutation.currentData()
+        obj = {}
+        if intent in ("waypoints", "speed_waypoints"):
+            obj["fuel_consumption"] = self.gen_obj_fuel.value()
+        if intent in ("speed_waypoints", "speed"):
+            obj["arrival_time"] = self.gen_obj_arrival.value()
+        c["GENETIC_OBJECTIVES"] = obj
+        # Speed / arrival time per intent — all set here; Boat page never touches these for genetic.
+        if intent == "waypoints":
+            sched = self.gen_sched.currentData() or "via_speed"
+            c["_GENETIC_SCHEDULE"] = sched
+            if sched == "via_speed":
+                c["BOAT_SPEED"] = self.gen_sched_speed.value()
+                c["ARRIVAL_TIME"] = ""
+            else:
+                c["ARRIVAL_TIME"] = (
+                    self.gen_sched_arrival.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm") + "Z"
+                )
+        elif intent == "speed_waypoints":
+            c["_GENETIC_SCHEDULE"] = "via_speed"
+            c["BOAT_SPEED"] = self.gen_sw_speed.value()
+            c["ARRIVAL_TIME"] = (
+                self.gen_sw_arrival.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm") + "Z"
+            )
+        else:  # speed
+            c["_GENETIC_SCHEDULE"] = "via_speed"
+            c["BOAT_SPEED"] = self.gen_s_speed.value()
+            c["ARRIVAL_TIME"] = ""
         c["GENETIC_NUMBER_OFFSPRINGS"] = self.gen_offsprings.value()
         c["GENETIC_POPULATION_SIZE"] = self.gen_pop_size.value()
         c["GENETIC_POPULATION_TYPE"] = self.gen_pop_type.currentData()
         c["GENETIC_POPULATION_PATH"] = self.gen_pop_path.text()
         c["GENETIC_REPAIR_TYPE"] = self.gen_repair.currentData()
-        c["GENETIC_MUTATION_TYPE"] = self.gen_mutation.currentData()
-        c["GENETIC_CROSSOVER_TYPE"] = self.gen_crossover.currentData()
         c["GENETIC_CROSSOVER_PATCHER"] = self.gen_crossover_patcher.currentData()
         c["GENETIC_FIX_RANDOM_SEED"] = self.gen_fix_seed.isChecked()
         # GCR Slider
@@ -356,12 +527,13 @@ class AlgorithmPage(QWizardPage):
 
     def initializePage(self):
         c = self.config
-        # Repopulate combo for the current boat type, then restore saved algorithm.
-        self._populate_algo_combo()
+        # Restore algorithm picker first so _current_algo() is consistent.
         algo = c.get("ALGORITHM_TYPE", "isofuel")
         idx = self.algo_combo.findData(algo)
+        self.algo_combo.blockSignals(True)
         self.algo_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.stack.setCurrentIndex(_ALGO_STACK.get(self.algo_combo.currentData(), 0))
+        self.algo_combo.blockSignals(False)
+        self._on_algo_changed(self.algo_combo.currentIndex())
         # Isofuel
         self.iso_n_routes.setValue(int(c.get("ISOCHRONE_NUMBER_OF_ROUTES") or 1))
         self.iso_min_crit.setCurrentIndex(self._find_combo_idx(self.iso_min_crit, c.get("ISOCHRONE_MINIMISATION_CRITERION", "squareddist_over_disttodest")))
@@ -370,20 +542,51 @@ class AlgorithmPage(QWizardPage):
         self.iso_prune_half.setValue(int(c.get("ISOCHRONE_PRUNE_SECTOR_DEG_HALF") or 91))
         self.iso_prune_segs.setValue(int(c.get("ISOCHRONE_PRUNE_SEGMENTS") or 20))
         self.iso_prune_sym.setCurrentIndex(self._find_combo_idx(self.iso_prune_sym, c.get("ISOCHRONE_PRUNE_SYMMETRY_AXIS", "gcr")))
-        # Genetic
+        # Genetic — restore the optimisation intent (infer for legacy configs).
+        intent = c.get("_GENETIC_INTENT")
+        if not intent:
+            cross = c.get("GENETIC_CROSSOVER_TYPE", "random")
+            intent = {"waypoints": "waypoints", "speed": "speed"}.get(cross, "speed_waypoints")
+        self.gen_intent.blockSignals(True)
+        self.gen_intent.setCurrentIndex(self._find_combo_idx(self.gen_intent, intent))
+        self.gen_intent.blockSignals(False)
+        sched = c.get("_GENETIC_SCHEDULE", "via_speed")
+        self.gen_sched.blockSignals(True)
+        self.gen_sched.setCurrentIndex(self._find_combo_idx(self.gen_sched, sched))
+        self.gen_sched.blockSignals(False)
         self.gen_generations.setValue(int(c.get("GENETIC_NUMBER_GENERATIONS") or 20))
         obj = c.get("GENETIC_OBJECTIVES") or {}
-        self.gen_obj_arrival.setValue(float(obj.get("arrival_time", 1.5)))
         self.gen_obj_fuel.setValue(float(obj.get("fuel_consumption", 1.5)))
+        self.gen_obj_arrival.setValue(float(obj.get("arrival_time", 1.5)))
+        raw_speed = float(c.get("BOAT_SPEED") or 6.17)
+        self.gen_sched_speed.setValue(raw_speed)
+        self.gen_sw_speed.setValue(raw_speed)
+        self.gen_s_speed.setValue(raw_speed)
+        arr_str = c.get("ARRIVAL_TIME", "")
+        if arr_str:
+            arr_dt = QDateTime.fromString(arr_str, "yyyy-MM-ddTHH:mmZ")
+            if arr_dt.isValid():
+                arr_dt.setTimeSpec(Qt.UTC)
+                local_dt = arr_dt.toLocalTime()
+                self.gen_sched_arrival.setDateTime(local_dt)
+                self.gen_sw_arrival.setDateTime(local_dt)
+            else:
+                self.gen_sw_arrival.setDateTime(QDateTime.currentDateTime())
+        else:
+            self.gen_sched_arrival.setDateTime(QDateTime.currentDateTime())
+            self.gen_sw_arrival.setDateTime(QDateTime.currentDateTime())
         self.gen_offsprings.setValue(int(c.get("GENETIC_NUMBER_OFFSPRINGS") or 2))
         self.gen_pop_size.setValue(int(c.get("GENETIC_POPULATION_SIZE") or 20))
+        self.gen_pop_type.blockSignals(True)
         self.gen_pop_type.setCurrentIndex(self._find_combo_idx(self.gen_pop_type, c.get("GENETIC_POPULATION_TYPE", "isofuel")))
+        self.gen_pop_type.blockSignals(False)
         self.gen_pop_path.setText(c.get("GENETIC_POPULATION_PATH", ""))
         self.gen_repair.setCurrentIndex(self._find_combo_idx(self.gen_repair, c.get("GENETIC_REPAIR_TYPE", "waypoints_infill")))
-        self.gen_mutation.setCurrentIndex(self._find_combo_idx(self.gen_mutation, c.get("GENETIC_MUTATION_TYPE", "random")))
-        self.gen_crossover.setCurrentIndex(self._find_combo_idx(self.gen_crossover, c.get("GENETIC_CROSSOVER_TYPE", "random")))
         self.gen_crossover_patcher.setCurrentIndex(self._find_combo_idx(self.gen_crossover_patcher, c.get("GENETIC_CROSSOVER_PATCHER", "isofuel")))
         self.gen_fix_seed.setChecked(bool(c.get("GENETIC_FIX_RANDOM_SEED", False)))
+        # Populate the mutation combo for the intent, then restore the saved value.
+        self._refresh_genetic_visibility()
+        self.gen_mutation.setCurrentIndex(self._find_combo_idx(self.gen_mutation, c.get("GENETIC_MUTATION_TYPE", "random")))
         # GCR Slider
         self.gcr_angle_step.setValue(float(c.get("GCR_SLIDER_ANGLE_STEP") or 30))
         self.gcr_distance_move.setValue(float(c.get("GCR_SLIDER_DISTANCE_MOVE") or 10000))

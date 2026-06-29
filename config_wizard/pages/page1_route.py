@@ -1,4 +1,4 @@
-"""Page 1 — Route: source, destination, waypoints, departure/arrival times, map bbox."""
+"""Page 1 — Route: source, destination, waypoints, departure time, map bbox."""
 from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QWizardPage, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
@@ -8,7 +8,7 @@ from qgis.PyQt.QtCore import Qt, QDateTime, pyqtSignal
 from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
 
-from .ui_kit import (
+from ..ui.ui_kit import (
     COLOR_ARRIVAL, COLOR_GREEN, COLOR_MUTED, COLOR_ORANGE, COLOR_PRIMARY,
     COLOR_REQUIRED, LatLonField, StatusLine, clear_button, coord_input,
     field_label, format_coords, in_range, make_badge, make_dashed_badge,
@@ -17,7 +17,7 @@ from .ui_kit import (
 
 
 class addWaypoint(QWidget):
-    """The dashed '+ Click map to add…' placeholder row."""
+    """The dashed '+ Click to add waypoint' placeholder row."""
     clicked = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -28,7 +28,7 @@ class addWaypoint(QWidget):
         row.setSpacing(8)
 
         self.badge = make_dashed_badge()
-        self.hint = QLabel("Click map to add…")
+        self.hint = QLabel("Click to add waypoint")
         self.hint.setStyleSheet(
             f"color: {COLOR_MUTED}; border: 1px dashed #cfd4dc; border-radius: 8px;"
             "padding: 6px 10px; background: #fbfcfd;"
@@ -68,8 +68,8 @@ class RoutePage(QWizardPage):
         root.setSpacing(16)
 
         root.addWidget(page_header(
-            "Source, destination & waypoints",
-            "Click on the map to place points, or enter coordinates directly in the panel.",
+            "Route",
+            "Set the source, destination, and departure time.",
         ))
 
         # Source / Destination
@@ -108,17 +108,11 @@ class RoutePage(QWizardPage):
         self.dep_dt, dep_widget = self._make_dt_field("D", COLOR_ORANGE, clearable=False)
         self.dep_dt.setDateTime(QDateTime.currentDateTime())
 
-        self.arr_dt, arr_widget = self._make_dt_field("A", COLOR_ARRIVAL, clearable=True)
-        self.arr_dt.setSpecialValueText("dd/mm/yyyy - hh:mm AM/PM")
-        self.arr_dt.setDateTime(self.arr_dt.minimumDateTime())  # show "empty" placeholder
-
         t_grid = QGridLayout()
         t_grid.setHorizontalSpacing(28)
         t_grid.setVerticalSpacing(6)
         t_grid.addWidget(field_label("Departure Time", required=True), 0, 0)
-        t_grid.addWidget(field_label("Arrival Time"), 0, 1)
         t_grid.addWidget(dep_widget, 1, 0)
-        t_grid.addWidget(arr_widget, 1, 1)
         t_grid.setColumnStretch(0, 1)
         t_grid.setColumnStretch(1, 1)
         root.addLayout(t_grid)
@@ -233,9 +227,7 @@ class RoutePage(QWizardPage):
         self.completeChanged.emit()
 
     def _on_add_waypoint_clicked(self):
-        field = self._add_waypoint()
-        if self._iface is not None:
-            self._start_map_pick(field, "waypoint")
+        self._add_waypoint()
 
     def _add_waypoint(self, lat=None, lon=None):
         idx = len(self.waypoint_rows) + 1
@@ -300,9 +292,6 @@ class RoutePage(QWizardPage):
             self.route_path.setText(path)
 
     # Status / completion
-    def _has_arrival(self):
-        return self.arr_dt.dateTime() != self.arr_dt.minimumDateTime()
-
     def _update_status(self):
         if self.status is None:
             return  # still being constructed
@@ -338,9 +327,6 @@ class RoutePage(QWizardPage):
             self.config["DEFAULT_ROUTE"] = f"{src[0]},{src[1]},{dst[0]},{dst[1]}"
 
         self.config["DEPARTURE_TIME"] = self.dep_dt.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm") + "Z"
-        self.config["ARRIVAL_TIME"] = (
-            self.arr_dt.dateTime().toUTC().toString("yyyy-MM-ddTHH:mm") + "Z" if self._has_arrival() else ""
-        )
         self.config["ROUTE_PATH"] = self.route_path.text()
 
         waypoints = []
@@ -383,12 +369,6 @@ class RoutePage(QWizardPage):
             if utc_dt.isValid():
                 utc_dt.setTimeSpec(Qt.UTC)
                 self.dep_dt.setDateTime(utc_dt.toLocalTime())
-        arr_str = self.config.get("ARRIVAL_TIME", "")
-        if arr_str:
-            utc_dt = QDateTime.fromString(arr_str, "yyyy-MM-ddTHH:mmZ")
-            if utc_dt.isValid():
-                utc_dt.setTimeSpec(Qt.UTC)
-                self.arr_dt.setDateTime(utc_dt.toLocalTime())
         self.route_path.setText(self.config.get("ROUTE_PATH", "/tmp/wrt_route.json"))
         self._update_status()
 
