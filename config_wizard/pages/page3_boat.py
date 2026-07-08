@@ -2,7 +2,7 @@
 from qgis.PyQt.QtWidgets import (
     QWizardPage, QVBoxLayout, QFormLayout, QLabel, QLineEdit,
     QComboBox, QGroupBox, QPushButton,
-    QWidget, QScrollArea, QHBoxLayout, QStackedWidget,
+    QWidget, QScrollArea, QHBoxLayout, QStackedWidget, QFileDialog
 )
 from qgis.PyQt.QtCore import Qt
 from ..core.defaults import (
@@ -96,6 +96,9 @@ class BoatPage(QWizardPage):
         self.speed_label = field_label("Speed", required=True)
         root.addWidget(self.speed_label)
         self.speed_ms = dspin(val=6.17, suffix="m/s", mx=60, dec=3)
+        speed_tip = "Typical merchant-ship cruising speed is around 7–12 m/s (≈14–23 knots)."
+        self.speed_label.setToolTip(speed_tip)
+        self.speed_ms.setToolTip(speed_tip)
         self.speed_ms.valueChanged.connect(self.completeChanged)
         root.addWidget(self.speed_ms)
 
@@ -312,7 +315,6 @@ class BoatPage(QWizardPage):
         self.speed_note.setVisible(hidden)
 
     def _browse_file(self, line_edit, file_filter):
-        from qgis.PyQt.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(self, "Select file", line_edit.text(), file_filter)
         if path:
             line_edit.setText(path)

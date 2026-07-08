@@ -1,51 +1,26 @@
 """Page 1 — Route: source, destination, waypoints, departure time, map bbox."""
 from qgis.PyQt.QtWidgets import (
-    QMessageBox,
+    QFrame, QMessageBox, QScrollArea,
     QWizardPage, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
-    QPushButton, QDateTimeEdit, QWidget,
+    QPushButton, QDateTimeEdit, QWidget, QFileDialog
 )
-from qgis.PyQt.QtCore import Qt, QDateTime, pyqtSignal
-from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
-from qgis.gui import QgsMapToolEmitPoint, QgsVertexMarker
+from qgis.PyQt.QtCore import Qt, QDateTime, QVariant
+from qgis.PyQt.QtGui import QColor, QFont
+from qgis.core import (
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature, QgsField,
+    QgsFillSymbol, QgsGeometry, QgsMarkerSymbol, QgsPalLayerSettings, QgsPointXY,
+    QgsProject, QgsRectangle, QgsRuleBasedRenderer, QgsTextBufferSettings,
+    QgsTextFormat, QgsUnitTypes, QgsVectorLayer, QgsVectorLayerSimpleLabeling,
+)
+from qgis.gui import QgsVertexMarker
 
 from ..ui.ui_kit import (
     COLOR_ARRIVAL, COLOR_GREEN, COLOR_MUTED, COLOR_ORANGE, COLOR_PRIMARY,
-    COLOR_REQUIRED, LatLonField, StatusLine, clear_button, coord_input,
-    field_label, format_coords, in_range, make_badge, make_dashed_badge,
+    COLOR_REQUIRED, LatLonField, StatusLine, addWaypoint, clear_button,
+    coord_input, field_label, format_coords, in_range, make_badge,
     page_header, set_field_error,
 )
-
-
-class addWaypoint(QWidget):
-    """The dashed '+ Click to add waypoint' placeholder row."""
-    clicked = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setCursor(Qt.PointingHandCursor)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        self.badge = make_dashed_badge()
-        self.hint = QLabel("Click to add waypoint")
-        self.hint.setStyleSheet(
-            f"color: {COLOR_MUTED}; border: 1px dashed #cfd4dc; border-radius: 8px;"
-            "padding: 6px 10px; background: #fbfcfd;"
-        )
-
-        row.addWidget(self.badge)
-        row.addWidget(self.hint, 1)
-        # Phantom spacers matching the pick + clear buttons so rows stay aligned.
-        for _ in range(2):
-            spacer = QWidget()
-            spacer.setFixedWidth(30)
-            row.addWidget(spacer)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
+from ..ui.map_tools import MapPointPicker, RectangleMapTool
 
 
 class RoutePage(QWizardPage):
@@ -59,11 +34,41 @@ class RoutePage(QWizardPage):
         self._active_label = None
         self._pick_map_tool = None
         self._pick_marker = None
+        # Memory point layer holding the labelled route markers
+        self._marker_layer = None
+        # Bounding-box state
+        self._bbox_layer = None
+        self._bbox_map_tool = None
+        self._bbox_prev_tool = None
+        self._setting_bbox = False   # True while filling the bbox fields programmatically
+        self._bbox_auto = False      # True while the box auto-tracks the route (±2°)
         self.status = None
         self._build_ui()
 
+        # Auto-derive the bounding box from the route by default.
+        self._bbox_auto = True
+
+        # Remove the map artifacts from the project when the wizard is closed.
+        if parent is not None:
+            parent.finished.connect(self._cleanup_map_artifacts)
+
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        page_layout.addWidget(scroll, 1)
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
         root.setContentsMargins(28, 22, 28, 18)
         root.setSpacing(16)
 
@@ -104,7 +109,7 @@ class RoutePage(QWizardPage):
                 field = self._add_waypoint()
                 field.set_coords(float(wpt[0]), float(wpt[1]))
 
-        # Departure / Arrival times
+        # Departure time
         self.dep_dt, dep_widget = self._make_dt_field("D", COLOR_ORANGE, clearable=False)
         self.dep_dt.setDateTime(QDateTime.currentDateTime())
 
@@ -117,8 +122,21 @@ class RoutePage(QWizardPage):
         t_grid.setColumnStretch(1, 1)
         root.addLayout(t_grid)
 
-        # Advanced (bbox + output path)
-        self.adv_toggle = QPushButton("▶  Advanced routing options")
+        # Output route path 
+        root.addWidget(field_label("Output route path", required=True))
+        self.route_path = QLineEdit(self.config.get("ROUTE_PATH", "/tmp"))
+        self.route_path.setPlaceholderText("Directory where the route output will be written")
+        self.route_path.textChanged.connect(lambda: self.completeChanged.emit())
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setAutoDefault(False)
+        browse_btn.clicked.connect(self.browse_route_path)
+        rp_row = QHBoxLayout()
+        rp_row.addWidget(self.route_path, 1)
+        rp_row.addWidget(browse_btn)
+        root.addLayout(rp_row)
+
+        # Advanced (bbox)
+        self.adv_toggle = QPushButton("▶  Advanced options")
         self.adv_toggle.setFlat(True)
         self.adv_toggle.setAutoDefault(False)
         self.adv_toggle.setDefault(False)
@@ -128,33 +146,45 @@ class RoutePage(QWizardPage):
             f" padding: 4px 0; font-weight: 600; color: {COLOR_MUTED}; }}"
             "QPushButton:hover { background: transparent; color: " + COLOR_PRIMARY + "; }"
         )
-        self.adv_toggle.clicked.connect(self._toggle_advanced)
+        self.adv_toggle.clicked.connect(self.toggle_advanced)
         root.addWidget(self.adv_toggle)
 
-        self.adv_widget = self._build_advanced()
+        self.adv_widget = self.build_advanced()
         self.adv_widget.setVisible(False)
         root.addWidget(self.adv_widget)
 
         root.addStretch(1)
 
-        # Status line
+        # Status line — pinned below the scroll area so it stays visible.
         self.status = StatusLine()
-        root.addWidget(self.status)
+        status_wrap = QWidget()
+        status_row = QHBoxLayout(status_wrap)
+        status_row.setContentsMargins(28, 6, 28, 12)
+        status_row.addWidget(self.status)
+        page_layout.addWidget(status_wrap)
         self._update_status()
 
-    def _build_advanced(self):
+    def build_advanced(self):
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.setContentsMargins(0, 4, 0, 0)
         lay.setSpacing(8)
 
         hint = QLabel(
-            "Routing bounding box — leave blank to auto-derive from "
-            "source/destination with a 2° buffer."
+            "Routing bounding box — automatically covers the source, destination "
+            "and waypoints with a ±2° margin. Draw on the map or type values to override."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
         lay.addWidget(hint)
+
+        self.bbox_draw_btn = QPushButton("✏  Draw on map")
+        self.bbox_draw_btn.setAutoDefault(False)
+        self.bbox_draw_btn.clicked.connect(self.start_bbox_draw)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.bbox_draw_btn)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
 
         self.bbox_lat_min = coord_input("lat min", -90.0, 90.0)
         self.bbox_lon_min = coord_input("lon min", -180.0, 180.0)
@@ -162,7 +192,7 @@ class RoutePage(QWizardPage):
         self.bbox_lon_max = coord_input("lon max", -180.0, 180.0)
         bbox_row = QHBoxLayout()
         for w in (self.bbox_lat_min, self.bbox_lon_min, self.bbox_lat_max, self.bbox_lon_max):
-            w.textChanged.connect(self._on_bbox_changed)
+            w.textChanged.connect(self.on_bbox_changed)
             bbox_row.addWidget(w)
         lay.addLayout(bbox_row)
 
@@ -171,16 +201,6 @@ class RoutePage(QWizardPage):
         self.bbox_msg.setStyleSheet(f"color: {COLOR_REQUIRED}; font-size: 11px;")
         self.bbox_msg.setVisible(False)
         lay.addWidget(self.bbox_msg)
-
-        lay.addWidget(field_label("Route output file", required=True))
-        self.route_path = QLineEdit(self.config.get("ROUTE_PATH", "/tmp/wrt_route.json"))
-        self.route_path.textChanged.connect(lambda: self.completeChanged.emit())
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_route_path)
-        rp_row = QHBoxLayout()
-        rp_row.addWidget(self.route_path, 1)
-        rp_row.addWidget(browse_btn)
-        lay.addLayout(rp_row)
         return box
 
     def _make_dt_field(self, badge_text, color, clearable):
@@ -209,11 +229,11 @@ class RoutePage(QWizardPage):
             row.addWidget(spacer)
         return dt, container
 
-    def _toggle_advanced(self):
+    def toggle_advanced(self):
         visible = not self.adv_widget.isVisible()
         self.adv_widget.setVisible(visible)
         self.adv_toggle.setText(
-            ("▼" if visible else "▶") + "  Advanced routing options"
+            ("▼" if visible else "▶") + "  Advanced options"
         )
 
     # Point / waypoint wiring
@@ -224,6 +244,10 @@ class RoutePage(QWizardPage):
 
     def _on_field_changed(self):
         self._update_status()
+        self._refresh_marker_layer()
+        # A route-derived (auto) bounding box tracks source/destination changes.
+        if self._bbox_auto:
+            self._derive_bbox_from_route(track=True)
         self.completeChanged.emit()
 
     def _on_add_waypoint_clicked(self):
@@ -245,6 +269,9 @@ class RoutePage(QWizardPage):
             self.waypoint_rows.remove(entry)
             field.setParent(None)
             self._renumber_waypoints()
+            self._refresh_marker_layer()
+            if self._bbox_auto:
+                self._derive_bbox_from_route(track=True)
             self._update_status()
         field.action_clicked.connect(remove)
 
@@ -275,21 +302,217 @@ class RoutePage(QWizardPage):
             return ("order", "Min values must be smaller than max values (lat min < lat max, lon min < lon max).")
         return ("ok", "")
 
-    def _on_bbox_changed(self):
+    def on_bbox_changed(self):
         state, msg = self._bbox_state()
+        # A hand-edit detaches the box from the route so it stops auto-tracking.
+        if not self._setting_bbox:
+            self._bbox_auto = False
         # Red-border any individual field that is non-empty and out of range.
         for f in (self.bbox_lat_min, self.bbox_lon_min, self.bbox_lat_max, self.bbox_lon_max):
             set_field_error(f, bool(f.text().strip()) and not in_range(f))
         self.bbox_msg.setText(msg)
         self.bbox_msg.setVisible(bool(msg))
+        self._refresh_bbox_layer()
         self._update_status()
         self.completeChanged.emit()
 
-    def _browse_route_path(self):
-        from qgis.PyQt.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getSaveFileName(self, "Route output file", self.route_path.text(), "JSON (*.json)")
+    def browse_route_path(self):
+        path = QFileDialog.getExistingDirectory(self, "Output route path", self.route_path.text())
         if path:
             self.route_path.setText(path)
+
+    # Bounding box — fields, derive, draw, and preview layer
+    def set_bbox_fields(self, lat_min, lon_min, lat_max, lon_max):
+        """Fill the four bbox fields programmatically (without flipping auto-tracking)."""
+        self._setting_bbox = True
+        try:
+            self.bbox_lat_min.setText(f"{lat_min:.4f}")
+            self.bbox_lon_min.setText(f"{lon_min:.4f}")
+            self.bbox_lat_max.setText(f"{lat_max:.4f}")
+            self.bbox_lon_max.setText(f"{lon_max:.4f}")
+        finally:
+            self._setting_bbox = False
+        self.on_bbox_changed()
+
+    def _bbox_wgs84(self):
+        """Current bbox as (lat_min, lon_min, lat_max, lon_max) if valid, else None."""
+        if self._bbox_state()[0] != "ok":
+            return None
+        return (
+            float(self.bbox_lat_min.text()), float(self.bbox_lon_min.text()),
+            float(self.bbox_lat_max.text()), float(self.bbox_lon_max.text()),
+        )
+
+    def _route_bbox_bounds(self):
+        """(lat_min, lon_min, lat_max, lon_max) padded ±2° around the source,
+        destination and waypoints (clamped to valid ranges), or None if the
+        route isn't defined yet."""
+        src = self.src_field.get_coords()
+        dst = self.dst_field.get_coords()
+        if not (src and dst):
+            return None
+        points = [src, dst]
+        for entry in self.waypoint_rows:
+            coords = entry["field"].get_coords()
+            if coords is not None:
+                points.append(coords)
+        buf = 2.0
+        lats = [p[0] for p in points]
+        lons = [p[1] for p in points]
+        return (
+            max(-90.0, min(lats) - buf), max(-180.0, min(lons) - buf),
+            min(90.0, max(lats) + buf), min(180.0, max(lons) + buf),
+        )
+
+    def _derive_bbox_from_route(self, track):
+        """Fill the bbox from the route ±2°. Returns False if the route isn't set."""
+        bounds = self._route_bbox_bounds()
+        if bounds is None:
+            return False
+        self.set_bbox_fields(*bounds)
+        self._bbox_auto = track
+        return True
+
+    # Interactive draw on the map
+    def start_bbox_draw(self):
+        if self._iface is None:
+            return
+
+        window = self.window()
+        if window is not None:
+            window.hide()
+        main_window = self._iface.mainWindow()
+        main_window.raise_()
+        main_window.activateWindow()
+
+        canvas = self._iface.mapCanvas()
+        self._bbox_prev_tool = canvas.mapTool()
+
+        tool = RectangleMapTool(canvas)
+        tool.rectangleConfirmed.connect(self._on_bbox_drawn)
+        tool.cancelled.connect(self.finish_bbox_draw)
+        canvas.setMapTool(tool)
+        self._bbox_map_tool = tool
+
+        # Seed with the existing box (if any) so the user can just adjust it.
+        current = self._bbox_wgs84()
+        if current is not None:
+            lat_min, lon_min, lat_max, lon_max = current
+            rect = QgsRectangle(lon_min, lat_min, lon_max, lat_max)
+            tool.set_rectangle(self._rect_to_canvas(rect))
+
+        self._iface.messageBar().pushInfo(
+            "Weather Routing Tool",
+            "Drag to draw the routing area; drag its edges/corners to adjust. "
+            "Double-click or Enter to confirm, Esc to cancel.",
+        )
+
+    def _on_bbox_drawn(self, rect_canvas):
+        """Confirm the drawn rectangle (canvas CRS) and commit it to the fields."""
+        rect = self._rect_to_wgs84(rect_canvas)
+        lat_min, lon_min = rect.yMinimum(), rect.xMinimum()
+        lat_max, lon_max = rect.yMaximum(), rect.xMaximum()
+
+        prompt = QMessageBox(self._iface.mainWindow())
+        prompt.setIcon(QMessageBox.Question)
+        prompt.setWindowTitle("Confirm bounding box")
+        prompt.setWindowModality(Qt.ApplicationModal)
+        prompt.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        prompt.setText(
+            "Use this routing area?\n"
+            f"lat {lat_min:.4f} … {lat_max:.4f}\n"
+            f"lon {lon_min:.4f} … {lon_max:.4f}"
+        )
+        use_btn = prompt.addButton("Use this area", QMessageBox.AcceptRole)
+        prompt.addButton("Keep adjusting", QMessageBox.RejectRole)
+        prompt.setDefaultButton(use_btn)
+        prompt.raise_()
+        prompt.activateWindow()
+        prompt.exec_()
+        if prompt.clickedButton() is not use_btn:
+            return  # stay in the draw tool for further adjustment
+
+        self.set_bbox_fields(lat_min, lon_min, lat_max, lon_max)
+        self._bbox_auto = False   # an explicitly drawn box does not track the route
+        self.finish_bbox_draw()
+
+    def finish_bbox_draw(self):
+        if self._bbox_map_tool is None:
+            return  # no draw session active
+        if self._iface is not None:
+            canvas = self._iface.mapCanvas()
+            if self._bbox_prev_tool is not None:
+                canvas.setMapTool(self._bbox_prev_tool)  # deactivates our tool (clears bands)
+            self._iface.messageBar().clearWidgets()
+        self._bbox_map_tool = None
+        self._bbox_prev_tool = None
+        self._restore_window()
+
+    # -- CRS helpers --
+    def _rect_to_canvas(self, rect_wgs84):
+        return self._transform_rect(rect_wgs84, to_canvas=True)
+
+    def _rect_to_wgs84(self, rect_canvas):
+        return self._transform_rect(rect_canvas, to_canvas=False)
+
+    def _transform_rect(self, rect, to_canvas):
+        canvas_crs = self._iface.mapCanvas().mapSettings().destinationCrs()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        src, dst = (wgs84, canvas_crs) if to_canvas else (canvas_crs, wgs84)
+        if src == dst:
+            return QgsRectangle(rect)
+        transform = QgsCoordinateTransform(src, dst, QgsProject.instance())
+        return transform.transformBoundingBox(rect)
+
+    # -- preview polygon layer --
+    def _refresh_bbox_layer(self):
+        box = self._bbox_wgs84()
+        if box is None:
+            self._remove_bbox_layer()
+            return
+        lat_min, lon_min, lat_max, lon_max = box
+        layer = self._ensure_bbox_layer()
+        provider = layer.dataProvider()
+        provider.truncate()
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(QgsGeometry.fromRect(
+            QgsRectangle(lon_min, lat_min, lon_max, lat_max)
+        ))
+        provider.addFeatures([feat])
+        layer.triggerRepaint()
+
+    def _ensure_bbox_layer(self):
+        if self._bbox_layer is not None:
+            return self._bbox_layer
+        layer = QgsVectorLayer("Polygon?crs=EPSG:4326", "WRT Routing Area", "memory")
+        symbol = QgsFillSymbol.createSimple({
+            "color": "37,99,235,30",
+            "outline_color": COLOR_PRIMARY,
+            "outline_width": "0.5",
+            "outline_style": "dash",
+        })
+        layer.renderer().setSymbol(symbol)
+        QgsProject.instance().addMapLayer(layer)
+        self._bbox_layer = layer
+        return layer
+
+    def _remove_bbox_layer(self):
+        if self._bbox_layer is not None:
+            QgsProject.instance().removeMapLayer(self._bbox_layer.id())
+            self._bbox_layer = None
+
+    def _cleanup_map_artifacts(self):
+        # Restore the map tool if a draw is mid-flight, but don't re-show the
+        # (closing) wizard window like finish_bbox_draw would.
+        if self._bbox_map_tool is not None and self._iface is not None:
+            canvas = self._iface.mapCanvas()
+            if self._bbox_prev_tool is not None:
+                canvas.setMapTool(self._bbox_prev_tool)
+            self._iface.messageBar().clearWidgets()
+            self._bbox_map_tool = None
+            self._bbox_prev_tool = None
+        self._remove_bbox_layer()
+        self._remove_marker_layer()
 
     # Status / completion
     def _update_status(self):
@@ -336,22 +559,20 @@ class RoutePage(QWizardPage):
                 waypoints.append([coords[0], coords[1]])
         self.config["INTERMEDIATE_WAYPOINTS"] = waypoints
 
-        # Build bbox — only use the manual values when they form a valid box, otherwise auto-derive (avoids persisting a partial/invalid bbox).
+        # Build bbox — prefer the field values when they form a valid box,
+        # otherwise fall back to the route-derived ±2° box (never persist a
+        # partial/invalid bbox).
         if self._bbox_state()[0] == "ok":
             self.config["DEFAULT_MAP"] = (
                 f"{self.bbox_lat_min.text()},{self.bbox_lon_min.text()},"
                 f"{self.bbox_lat_max.text()},{self.bbox_lon_max.text()}"
             )
-        elif src and dst:
-            lat_s, lon_s = src
-            lat_d, lon_d = dst
-            buf = 2.0
-            self.config["DEFAULT_MAP"] = (
-                f"{min(lat_s, lat_d) - buf},{min(lon_s, lon_d) - buf},"
-                f"{max(lat_s, lat_d) + buf},{max(lon_s, lon_d) + buf}"
-            )
         else:
-            self.config["DEFAULT_MAP"] = ""
+            bounds = self._route_bbox_bounds()
+            if bounds is not None:
+                self.config["DEFAULT_MAP"] = "{},{},{},{}".format(*bounds)
+            else:
+                self.config["DEFAULT_MAP"] = ""
 
     def initializePage(self):
         route = self.config.get("DEFAULT_ROUTE", "")
@@ -369,7 +590,21 @@ class RoutePage(QWizardPage):
             if utc_dt.isValid():
                 utc_dt.setTimeSpec(Qt.UTC)
                 self.dep_dt.setDateTime(utc_dt.toLocalTime())
-        self.route_path.setText(self.config.get("ROUTE_PATH", "/tmp/wrt_route.json"))
+        self.route_path.setText(self.config.get("ROUTE_PATH", "/tmp"))
+
+        # Restore a previously-set bounding box into the fields (and its preview).
+        bbox = self.config.get("DEFAULT_MAP", "")
+        if bbox:
+            parts = [p.strip() for p in bbox.split(",")]
+            if len(parts) == 4:
+                try:
+                    self.set_bbox_fields(
+                        float(parts[0]), float(parts[1]),
+                        float(parts[2]), float(parts[3]),
+                    )
+                    self._bbox_auto = False
+                except ValueError:
+                    pass
         self._update_status()
 
     # Map picking
@@ -391,14 +626,15 @@ class RoutePage(QWizardPage):
         canvas = self._iface.mapCanvas()
         self._previous_map_tool = canvas.mapTool()
 
-        map_tool = QgsMapToolEmitPoint(canvas)
+        map_tool = MapPointPicker(canvas)
         map_tool.canvasClicked.connect(self._handle_map_click)
         canvas.setMapTool(map_tool)
         self._pick_map_tool = map_tool
 
         self._iface.messageBar().pushInfo(
             "Weather Routing Tool",
-            f"Click on the map to set the {label} location. Right-click to cancel.",
+            f"Click on the map to set the {label} location. "
+            "Drag to pan, scroll to zoom. Right-click to cancel.",
         )
 
     def _clear_pick_marker(self):
@@ -407,6 +643,100 @@ class RoutePage(QWizardPage):
             if canvas is not None:
                 canvas.scene().removeItem(self._pick_marker)
             self._pick_marker = None
+
+    # Labelled route-marker layer
+    def _collect_points(self):
+        """(role, label, lat, lon) for every point field that has valid coords."""
+        points = []
+        src = self.src_field.get_coords()
+        if src is not None:
+            points.append(("source", "Source", src[0], src[1]))
+        dst = self.dst_field.get_coords()
+        if dst is not None:
+            points.append(("destination", "Destination", dst[0], dst[1]))
+        for i, entry in enumerate(self.waypoint_rows, start=1):
+            coords = entry["field"].get_coords()
+            if coords is not None:
+                points.append(("waypoint", f"WP{i}", coords[0], coords[1]))
+        return points
+
+    def _refresh_marker_layer(self):
+        """Rebuild the marker layer's features from the current field coordinates."""
+        points = self._collect_points()
+        if not points:
+            self._remove_marker_layer()
+            return
+
+        layer = self._ensure_marker_layer()
+        provider = layer.dataProvider()
+        provider.truncate()  # drop existing features; we rebuild from scratch
+
+        feats = []
+        for role, label, lat, lon in points:
+            feat = QgsFeature(layer.fields())
+            feat.setAttributes([role, label])
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+            feats.append(feat)
+        provider.addFeatures(feats)
+        layer.triggerRepaint()
+
+    def _ensure_marker_layer(self):
+        if self._marker_layer is not None:
+            return self._marker_layer
+        layer = QgsVectorLayer("Point?crs=EPSG:4326", "WRT Route Points", "memory")
+        provider = layer.dataProvider()
+        provider.addAttributes([
+            QgsField("role", QVariant.String),
+            QgsField("label", QVariant.String),
+        ])
+        layer.updateFields()
+        self._style_marker_layer(layer)
+        QgsProject.instance().addMapLayer(layer)
+        self._marker_layer = layer
+        return layer
+
+    def _style_marker_layer(self, layer):
+        def rule(name, expr, color):
+            symbol = QgsMarkerSymbol.createSimple({
+                "name": "circle", "size": "3.5", "size_unit": "MM",
+                "color": color, "outline_color": "white", "outline_width": "0.4",
+            })
+            r = QgsRuleBasedRenderer.Rule(symbol)
+            r.setFilterExpression(expr)
+            r.setLabel(name)
+            return r
+
+        root = QgsRuleBasedRenderer.Rule(None)
+        root.appendChild(rule("Source", "\"role\" = 'source'", COLOR_GREEN))
+        root.appendChild(rule("Destination", "\"role\" = 'destination'", COLOR_ORANGE))
+        root.appendChild(rule("Waypoint", "\"role\" = 'waypoint'", COLOR_PRIMARY))
+        layer.setRenderer(QgsRuleBasedRenderer(root))
+
+        fmt = QgsTextFormat()
+        font = QFont("Sans Serif", 9)
+        font.setBold(True)
+        fmt.setFont(font)
+        buf = QgsTextBufferSettings()
+        buf.setEnabled(True)
+        buf.setSize(1.0)
+        buf.setColor(QColor("white"))
+        fmt.setBuffer(buf)
+
+        pal = QgsPalLayerSettings()
+        pal.fieldName = "label"
+        pal.enabled = True
+        pal.setFormat(fmt)
+        pal.placement = QgsPalLayerSettings.AroundPoint
+        pal.dist = 2.5
+        pal.distUnits = QgsUnitTypes.RenderMillimeters
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+        layer.setLabelsEnabled(True)
+
+    def _remove_marker_layer(self):
+        self._clear_pick_marker()
+        if self._marker_layer is not None:
+            QgsProject.instance().removeMapLayer(self._marker_layer.id())
+            self._marker_layer = None
 
     def _restore_window(self):
         window = self.window()

@@ -1,13 +1,16 @@
 """Shared UI toolkit — colours, global stylesheet, badges and the coordinate field."""
+import os
 import re
 
 from qgis.PyQt.QtCore import Qt, QLocale, pyqtSignal
 from qgis.PyQt.QtGui import QDoubleValidator
 from qgis.PyQt.QtWidgets import (
-    QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QSizePolicy, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QSizePolicy, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
+# Check icon svg path
+CHECK_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "resources", "check.svg")
 
 # Palette
 COLOR_BG = "#ffffff"
@@ -95,16 +98,45 @@ QPushButton:default {{
 QPushButton:default:hover {{ background: {COLOR_PRIMARY_DARK}; }}
 QCheckBox {{ spacing: 8px; color: {COLOR_TEXT}; }}
 QCheckBox::indicator {{
-    width: 16px; height: 16px;
+    width: 18px; height: 18px;
     border: 1px solid {COLOR_INPUT_BORDER};
-    border-radius: 4px;
+    border-radius: 5px;
     background: #ffffff;
+}}
+QCheckBox::indicator:unchecked:hover {{
+    border: 1px solid {COLOR_PRIMARY};
+    background: {COLOR_PRIMARY_SOFT};
 }}
 QCheckBox::indicator:checked {{
     background: {COLOR_PRIMARY};
     border: 1px solid {COLOR_PRIMARY};
-    image: none;
+    image: url({CHECK_PATH});
 }}
+QCheckBox::indicator:checked:hover {{ background: {COLOR_PRIMARY_DARK}; border-color: {COLOR_PRIMARY_DARK}; }}
+QCheckBox::indicator:disabled {{ background: #f3f4f6; border-color: {COLOR_BORDER}; }}
+QCheckBox:disabled {{ color: {COLOR_MUTED}; }}
+
+/* CheckCard — a selectable option row (see the CheckCard widget). */
+QFrame#CheckCard {{
+    border: 1px solid {COLOR_INPUT_BORDER};
+    border-radius: 10px;
+    background: #ffffff;
+}}
+QFrame#CheckCard:hover {{ border-color: {COLOR_PRIMARY}; background: #fafbff; }}
+QFrame#CheckCard[checked="true"] {{ border: 1px solid {COLOR_PRIMARY}; background: {COLOR_PRIMARY_SOFT}; }}
+QFrame#CheckCard[checked="true"]:hover {{ background: {COLOR_PRIMARY_SOFT}; }}
+QLabel#CheckCardBox {{
+    border: 1px solid {COLOR_INPUT_BORDER};
+    border-radius: 6px;
+    background: #ffffff;
+    color: #ffffff;
+    font-size: 13px; font-weight: 700;
+}}
+QFrame#CheckCard[checked="true"] QLabel#CheckCardBox {{
+    background: {COLOR_PRIMARY}; border: 1px solid {COLOR_PRIMARY};
+}}
+QLabel#CheckCardTitle {{ font-size: 13px; font-weight: 600; color: {COLOR_TEXT}; background: transparent; }}
+QLabel#CheckCardDesc {{ font-size: 11px; color: {COLOR_MUTED}; background: transparent; }}
 QScrollBar:vertical {{
     background: transparent; width: 10px; margin: 0;
 }}
@@ -175,6 +207,38 @@ def make_dashed_badge(diameter=26):
     return lbl
 
 
+class addWaypoint(QWidget):
+    """The dashed '+ Click to add waypoint' placeholder row."""
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.badge = make_dashed_badge()
+        self.hint = QLabel("Click to add waypoint")
+        self.hint.setStyleSheet(
+            f"color: {COLOR_MUTED}; border: 1px dashed #cfd4dc; border-radius: 8px;"
+            "padding: 6px 10px; background: #fbfcfd;"
+        )
+
+        row.addWidget(self.badge)
+        row.addWidget(self.hint, 1)
+        # Phantom spacers matching the pick + clear buttons so rows stay aligned.
+        for _ in range(2):
+            spacer = QWidget()
+            spacer.setFixedWidth(30)
+            row.addWidget(spacer)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 def field_label(text, required=False):
     lbl = QLabel(
         f"{text} <span style='color:{COLOR_REQUIRED}'>*</span>" if required else text
@@ -238,6 +302,76 @@ def join_terms(items):
     if len(items) == 2:
         return f"{items[0]} and {items[1]}"
     return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+class CheckCard(QFrame):
+    """A selectable option row — check indicator + title (+ optional description).
+
+    Behaves like a QCheckBox (``isChecked`` / ``setChecked`` / ``toggled``) but
+    renders as a whole-row clickable, highlightable card. Styling lives in
+    GLOBAL_QSS under the ``CheckCard`` object names.
+    """
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, title, description="", parent=None):
+        super().__init__(parent)
+        self._checked = False
+        self.setObjectName("CheckCard")
+        self.setCursor(Qt.PointingHandCursor)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 10, 12, 10)
+        row.setSpacing(12)
+
+        self._box = QLabel()
+        self._box.setObjectName("CheckCardBox")
+        self._box.setFixedSize(20, 20)
+        self._box.setAlignment(Qt.AlignCenter)
+        row.addWidget(self._box, 0, Qt.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(2)
+        self._title = QLabel(title)
+        self._title.setObjectName("CheckCardTitle")
+        text_col.addWidget(self._title)
+        if description:
+            desc = QLabel(description)
+            desc.setObjectName("CheckCardDesc")
+            desc.setWordWrap(True)
+            desc.setAttribute(Qt.WA_TransparentForMouseEvents)
+            text_col.addWidget(desc)
+        row.addLayout(text_col, 1)
+
+        # Clicks anywhere on the card should reach the frame, not the labels.
+        for w in (self._box, self._title):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+        self._sync()
+
+    def isChecked(self):
+        return self._checked
+
+    def setChecked(self, checked):
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._sync()
+        self.toggled.emit(checked)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setChecked(not self._checked)
+        super().mousePressEvent(event)
+
+    def _sync(self):
+        self.setProperty("checked", self._checked)
+        self._box.setText("✓" if self._checked else "")
+        # Re-polish so the property-based QSS (card + indicator) re-applies.
+        for w in (self, self._box):
+            w.style().unpolish(w)
+            w.style().polish(w)
 
 
 class StatusLine(QWidget):
@@ -490,15 +624,28 @@ class LatLonField(QWidget):
         self.badge = make_badge(badge_text, badge_color, clickable=True)
         self.badge.clicked.connect(self.pick_requested)
 
-        self.lat = coord_input("Lat", -90.0, 90.0)
-        self.lat.setToolTip("Latitude (−90 to 90)")
-        self.lon = coord_input("Lon", -180.0, 180.0)
-        self.lon.setToolTip("Longitude (−180 to 180)")
+        self.lat = coord_input("e.g. 12.34", -90.0, 90.0)
+        self.lat.setToolTip("−90 to 90")
+        self.lon = coord_input("e.g. 77.56", -180.0, 180.0)
+        self.lon.setToolTip("−180 to 180")
         self.lat.textChanged.connect(self._on_text_changed)
         self.lon.textChanged.connect(self._on_text_changed)
 
+        # Persistent captions so the user can tell latitude from longitude even
+        # once both inputs are filled (a placeholder would disappear).
+        cap_css = (
+            f"color: {COLOR_MUTED}; font-size: 10px; font-weight: 600;"
+            " background: transparent;"
+        )
+        lat_cap = QLabel("Lat")
+        lat_cap.setStyleSheet(cap_css)
+        lon_cap = QLabel("Lon")
+        lon_cap.setStyleSheet(cap_css)
+
         row.addWidget(self.badge)
+        row.addWidget(lat_cap)
         row.addWidget(self.lat, 1)
+        row.addWidget(lon_cap)
         row.addWidget(self.lon, 1)
 
         if show_pick:

@@ -1,12 +1,19 @@
-"""Page 5 — Constraints: checkboxes for each constraint type."""
+"""Page 5 — Constraints: selectable cards for each constraint type."""
 from qgis.PyQt.QtWidgets import (
-    QWizardPage, QVBoxLayout, QLabel, QCheckBox, QGroupBox
+    QWizardPage, QVBoxLayout, QLabel
 )
 from qgis.PyQt.QtCore import Qt
 from ..core.defaults import CONSTRAINT_OPTIONS
-from ..ui.ui_kit import StatusLine, page_header
+from ..ui.ui_kit import CheckCard, StatusLine, page_header
 
 DEFAULT_CONSTRAINTS = ["land_crossing_global_land_mask", "water_depth", "on_map"]
+
+CONSTRAINT_DESCRIPTIONS = {
+    "land_crossing_global_land_mask": "Prevent the route from crossing land, using the global land mask.",
+    "water_depth": "Keep the route in water deep enough for the vessel's draught.",
+    "on_map": "Restrict routing to the configured bounding box (map extent).",
+    "via_waypoints": "Force the route to pass through the intermediate waypoints.",
+}
 
 
 class ConstraintsPage(QWizardPage):
@@ -26,21 +33,15 @@ class ConstraintsPage(QWizardPage):
             "Select which constraints the routing algorithm must respect.",
         ))
 
-        # Constraint checkboxes
-        cons_box = QGroupBox("Active constraints    ")
-        cons_layout = QVBoxLayout(cons_box)
-        cons_layout.setSpacing(6)
-
+        # Constraint option cards
         self.check_map = {}
 
         for val, label in CONSTRAINT_OPTIONS:
-            cb = QCheckBox(label)
-            cb.setChecked(val in DEFAULT_CONSTRAINTS)
-            cb.toggled.connect(self._update_status)
-            self.check_map[val] = cb
-            cons_layout.addWidget(cb)
-
-        root.addWidget(cons_box)
+            card = CheckCard(label, CONSTRAINT_DESCRIPTIONS.get(val, ""))
+            card.setChecked(val in DEFAULT_CONSTRAINTS)
+            card.toggled.connect(self._update_status)
+            self.check_map[val] = card
+            root.addWidget(card)
 
         # Info note
         note = QLabel(

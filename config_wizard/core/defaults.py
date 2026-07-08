@@ -11,13 +11,13 @@ DEFAULTS = {
     "DEPARTURE_TIME": "",       # yyyy-mm-ddThh:mmZ
     "ARRIVAL_TIME": "",         # optional
     "INTERMEDIATE_WAYPOINTS": [],   # [[lat,lon], ...]
-    "ROUTE_PATH": "/tmp/wrt_route.json",
+    "ROUTE_PATH": "",
 
     # --- Boat (Page 2) ---
     "BOAT_LENGTH": "",
     "BOAT_BREADTH": "",
     "BOAT_TYPE": "direct_power_method",
-    "BOAT_SPEED": 5.0,         # m/s
+    "BOAT_SPEED": 7.0,         # m/s
     "BOAT_FUEL_RATE": "",
     "BOAT_HBR": "",
     "BOAT_SMCR_POWER": "",

@@ -193,7 +193,7 @@ class AlgorithmPage(QWizardPage):
         v.addWidget(req)
 
         # Objective weights (contextual)
-        self.gen_obj_box = QGroupBox("Objective weights (GENETIC_OBJECTIVES)")
+        self.gen_obj_box = QGroupBox("Objective weights")
         obj_form = QFormLayout(self.gen_obj_box)
         obj_form.setLabelAlignment(Qt.AlignRight)
         obj_form.setSpacing(8)

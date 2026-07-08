@@ -11,6 +11,7 @@ from qgis.PyQt.QtWidgets import (
     QHBoxLayout,
     QFrame,
     QLabel,
+    QMessageBox,
     QProgressBar,
     QSizePolicy,
     QVBoxLayout,
@@ -278,6 +279,27 @@ class WRTConfigWizard(QWizard):
         return super().validateCurrentPage()
 
 
+    AUTOPOPULATED_KEYS = frozenset({"DEPARTURE_TIME", "DEFAULT_MAP", "ROUTE_PATH"})
+
+    def has_changes(self):
+        """True if the user has entered anything meaningful beyond the defaults."""
+        self._save_page(self.currentId())
+        for key, default in DEFAULTS.items():
+            if key.startswith("_") or key in self.AUTOPOPULATED_KEYS:
+                continue
+            if self.config.get(key) != default:
+                return True
+        return False
+
+    def reject(self):
+        """Close the wizard, prompting to discard if there are unsaved changes."""
+        window = self.window()
+        if window is not None and window is not self:
+            window.close()
+        else:
+            super().reject()
+
+
 class WRTConfigWindow(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent or iface.mainWindow())
@@ -310,7 +332,37 @@ class WRTConfigWindow(QDialog):
         self.wizard.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.wizard.setWindowFlags(Qt.Widget)
         self.wizard.accepted.connect(self.accept)
-        self.wizard.rejected.connect(self.reject)
+        # Cancel/close is routed through a confirm dialog to avoid accidental loss of user input.
 
         root.addWidget(self.sidebar)
         root.addWidget(self.wizard, 1)
+
+    def confirm_discard(self):
+        """Return True if the wizard may close (nothing entered, or user confirms)."""
+        if not self.wizard.has_changes():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Confirm")
+        box.setText(
+            "The configuration you've entered will be lost.\n"
+            "Are you sure you want to close the wizard?"
+        )
+        discard_btn = box.addButton("Discard", QMessageBox.DestructiveRole)
+        keep_btn = box.addButton("Keep editing", QMessageBox.RejectRole)
+        box.setDefaultButton(keep_btn)
+        box.exec_()
+        return box.clickedButton() is discard_btn
+
+    def reject(self):
+        # Escape key and the wizard's Cancel button land here.
+        if self.confirm_discard():
+            super().reject()
+
+    def closeEvent(self, event):
+        # Title-bar close / Alt+F4.
+        if self.confirm_discard():
+            event.accept()
+            QDialog.reject(self)
+        else:
+            event.ignore()

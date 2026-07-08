@@ -1,235 +1,236 @@
-"""Page 4 — Weather & depth datasets: file paths, time params, and NetCDF validation."""
+"""Page 4 — Weather & depth datasets"""
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from qgis.PyQt.QtWidgets import (
     QWizardPage, QVBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QGroupBox, QSpinBox, QHBoxLayout,
-    QFileDialog
+    QFileDialog, QFrame, QStyle, QScrollArea, QWidget, QProgressBar
 )
 from qgis.PyQt.QtCore import Qt
-from osgeo import gdal, osr
+from qgis.core import QgsApplication
 
+from ..core.netcdf_validation import InspectNetcdfTask, check_coverage
 from ..ui.ui_kit import (
-    COLOR_FILE_ERROR, COLOR_FILE_OK, COLOR_MUTED, COLOR_WARNING, StatusLine,
-    opt_label, page_header,
+    COLOR_BORDER, COLOR_FILE_ERROR, COLOR_FILE_OK, COLOR_INPUT_BORDER,
+    COLOR_MUTED, COLOR_PRIMARY, COLOR_PRIMARY_SOFT, COLOR_REQUIRED,
+    COLOR_SIDEBAR_BG, COLOR_TEXT, COLOR_WARNING, StatusLine, opt_label,
+    page_header,
 )
 
-UNIT_SECONDS = {
-    "seconds": 1, "second": 1, "secs": 1, "sec": 1, "s": 1,
-    "minutes": 60, "minute": 60, "mins": 60, "min": 60,
-    "hours": 3600, "hour": 3600, "hrs": 3600, "hr": 3600, "h": 3600,
-    "days": 86400, "day": 86400, "d": 86400,
-}
-
-def parse_time_units(units):
-    """Parse a CF time-units string like 'hours since 1970-01-01 00:00:00'.
-
-    :return: (seconds_per_unit, reference_datetime) or None if unparseable.
-    """
-    m = re.match(r"\s*(\w+)\s+since\s+(.+)", units, re.IGNORECASE)
-    if not m:
-        return None
-    unit, ref = m.group(1).lower(), m.group(2).strip()
-    if unit not in UNIT_SECONDS:
-        return None
-    # Normalise the reference date: drop trailing 'Z'/timezone, fractional secs.
-    ref = ref.replace("T", " ").rstrip("Z").strip()
-    ref = re.sub(r"\s+[+-]\d{1,2}:?\d{2}$", "", ref)      # strip +HH:MM offset
-    ref = re.sub(r"\.\d+", "", ref)                       # strip fractional secs
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return UNIT_SECONDS[unit], datetime.strptime(ref, fmt)
-        except ValueError:
-            continue
-    return None
-
-def _datasets(path):
-    """Open a file and yield a gdal dataset per geospatial variable.
-
-    NetCDF variables are exposed as GDAL subdatasets (NETCDF:"file":var); a
-    plain raster has none, so the root dataset itself is yielded.
-    
-    :raises ValueError: if the file cannot be opened by GDAL at all.
-    """
-    def _open(name):
-        # GDAL <4 returns None on failure; GDAL 4 / UseExceptions() raises.
-        try:
-            return gdal.Open(name)
-        except RuntimeError:
-            return None
-
-    gdal.PushErrorHandler("CPLQuietErrorHandler")
-    try:
-        root = _open(path)
-        if root is None:
-            raise ValueError("not a readable NetCDF/raster file")
-        subs = root.GetSubDatasets()
-        if not subs:
-            yield root
-            return
-        for name, _desc in subs:
-            ds = _open(name)
-            if ds is not None:
-                yield ds
-    finally:
-        gdal.PopErrorHandler()
-
-def spatial_extent(ds, gt):
-    """Return ((lat_min, lon_min, lat_max, lon_max), (dx, dy)) for a dataset.
-
-    The extent is shrunk by half a cell so it describes the grid's cell-CENTRE
-    coverage — the region where values can actually be interpolated — rather
-    than GDAL's pixel-edge bounds. Coordinates are reprojected to WGS84 when the
-    dataset declares a non-geographic CRS; NetCDF grids 
-    usually carry none, in which case the raw lon/lat degrees are used as-is.
-    """
-    nx, ny = ds.RasterXSize, ds.RasterYSize
-    dx, dy = abs(gt[1]), abs(gt[5])
-    # Pixel-edge corners from the geotransform, then pull in half a cell.
-    xs = sorted((gt[0], gt[0] + gt[1] * nx))
-    ys = sorted((gt[3], gt[3] + gt[5] * ny))
-    lon_min, lon_max = xs[0] + dx / 2, xs[1] - dx / 2
-    lat_min, lat_max = ys[0] + dy / 2, ys[1] - dy / 2
-
-    wkt = ds.GetProjection()
-    if wkt:
-        src = osr.SpatialReference()
-        src.ImportFromWkt(wkt)
-        if not src.IsGeographic():
-            dst = osr.SpatialReference()
-            dst.ImportFromEPSG(4326)
-            dst.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-            src.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-            tr = osr.CoordinateTransformation(src, dst)
-            corners = [tr.TransformPoint(x, y)[:2]
-                       for x in (lon_min, lon_max) for y in (lat_min, lat_max)]
-            lons = [c[0] for c in corners]
-            lats = [c[1] for c in corners]
-            lon_min, lon_max = min(lons), max(lons)
-            lat_min, lat_max = min(lats), max(lats)
-    return (lat_min, lon_min, lat_max, lon_max), (dx, dy)
-
-def time_axis(ds):
-    """Return (sorted_timestamps, calendar) for a dataset's CF time dimension.
-
-    Reads the canonical GDAL metadata (`<dim>#units`, `<dim>#calendar`,
-    `NETCDF_DIM_<dim>_VALUES`) rather than parsing per-band label strings, so it
-    sees the full axis in order. Returns None if the dataset has no parseable
-    time dimension (e.g. static bathymetry).
-    """
-    md = ds.GetMetadata()
-    for key, units in md.items():
-        if not key.endswith("#units") or "since" not in units.lower():
-            continue
-        dim = key[:-len("#units")]
-        raw = md.get("NETCDF_DIM_%s_VALUES" % dim)
-        parsed = parse_time_units(units)
-        if not raw or not parsed:
-            continue
-        per_unit, ref = parsed
-        try:
-            values = [float(v) for v in raw.strip("{} ").split(",") if v.strip()]
-        except ValueError:
-            continue
-        if not values:
-            continue
-        stamps = sorted(ref + timedelta(seconds=v * per_unit) for v in values)
-        calendar = md.get("%s#calendar" % dim, "").lower()
-        return stamps, calendar
-    return None
-
-def median_step_hours(stamps):
-    """Median spacing between consecutive timestamps, in hours (None if <2)."""
-    diffs = sorted((stamps[i + 1] - stamps[i]).total_seconds()
-                   for i in range(len(stamps) - 1))
-    diffs = [d for d in diffs if d > 0]
-    if not diffs:
-        return None
-    mid = len(diffs) // 2
-    med = diffs[mid] if len(diffs) % 2 else (diffs[mid - 1] + diffs[mid]) / 2
-    return med / 3600.0
-
-
-def inspect_netcdf(path):
-    """Inspect a NetCDF file's spatial extent and time dimension via GDAL.
-
-    :return: dict with 'extent' (lat_min, lon_min, lat_max, lon_max), 'cell'
-             (dx, dy in degrees) and, when a time axis is present, 'time'
-             (min_dt, max_dt), 'time_step_hours' and 'calendar'.
-    :raises ValueError: if the file cannot be opened or has no geospatial grid.
-    """
-    extent = cell = time_info = None
-    for ds in _datasets(path):
-        gt = ds.GetGeoTransform(can_return_null=True)
-        if gt is None or ds.RasterXSize < 2 or ds.RasterYSize < 2:
-            continue  # non-spatial variable (time_bnds, crs, …)
-        if extent is None:
-            extent, cell = spatial_extent(ds, gt)
-        if time_info is None:
-            time_info = time_axis(ds)
-        if extent is not None and time_info is not None:
-            break
-
-    if extent is None:
-        raise ValueError("no geospatial grid found (missing latitude/longitude)")
-
-    info = {"extent": extent, "cell": cell}
-    if time_info:
-        stamps, calendar = time_info
-        info["time"] = (stamps[0], stamps[-1])
-        info["time_step_hours"] = median_step_hours(stamps)
-        info["calendar"] = calendar
-    return info
-
-
-def lon_within(e_lon_min, e_lon_max, lon):
-    """True if a WGS84 longitude falls in [e_lon_min, e_lon_max] under either the
-    -180..180 or 0..360 convention."""
-    return any(e_lon_min <= cand <= e_lon_max for cand in (lon, lon + 360, lon - 360))
-
-
-def _covers(extent, lat_min, lon_min, lat_max, lon_max):
-    e_lat_min, e_lon_min, e_lat_max, e_lon_max = extent
-    return (e_lat_min <= lat_min <= e_lat_max and
-            e_lat_min <= lat_max <= e_lat_max and
-            lon_within(e_lon_min, e_lon_max, lon_min) and
-            lon_within(e_lon_min, e_lon_max, lon_max))
+# Drop-zone and badge background tints per validation state.
+ZONE_BG_NEUTRAL = "#f8f9fb"
+ZONE_BG_OK = "#eaf3e2"
+ZONE_BG_ERR = "#fbeae3"
+ZONE_BG_WARN = "#fdf2e2"
+BADGE_BG_OPTIONAL = "#eceef1"
+BADGE_BG_REQUIRED = "#fbe7e8"
 
 
 # UI helpers
-class _FileField(QGroupBox):
-    """A group box with a file path input, browse button, and status label."""
-    def __init__(self, title, placeholder, file_filter="NetCDF (*.nc)", parent=None):
-        super().__init__(title, parent)
+class FileField(QFrame):
+    """A dataset card: a prominent drag-and-drop zone over a Browse/Clear row"""
+    def __init__(self, title, placeholder, file_filter="NetCDF (*.nc)",
+                 optional=False, parent=None):
+        super().__init__(parent)
         self._filter = file_filter
+        self._optional = optional
+        self._last = (None, "", False)   # last (state, message, warn) for repaint
+
+        self.setObjectName("DatasetCard")
+        self.setStyleSheet(
+            f"QFrame#DatasetCard {{ border: 1px solid {COLOR_INPUT_BORDER}; "
+            f"border-radius: 10px; background: #ffffff; }}"
+        )
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
 
-        self.status_lbl = QLabel("No file selected")
-        self.status_lbl.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
-        self.status_lbl.setWordWrap(True)
-        layout.addWidget(self.status_lbl)
+        # Header: folder icon + title .......... state badge
+        header = QHBoxLayout()
+        icon = QLabel()
+        icon.setPixmap(self.style().standardIcon(QStyle.SP_DirIcon).pixmap(18, 18))
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            f"font-size: 13px; font-weight: 600; color: {COLOR_TEXT};"
+        )
+        self.badge = QLabel()
+        self.badge.setAlignment(Qt.AlignCenter)
+        header.addWidget(icon)
+        header.addWidget(title_lbl)
+        header.addStretch()
+        header.addWidget(self.badge)
+        layout.addLayout(header)
 
+        # Drop zone — the primary, visible drag target; click anywhere to browse.
+        self.zone = QFrame()
+        self.zone.setObjectName("DropZone")
+        self.zone.setCursor(Qt.PointingHandCursor)
+        self.zone.setMinimumHeight(56)
+        self.zone.mousePressEvent = lambda _e: self._browse()
+        zone_lay = QVBoxLayout(self.zone)
+        zone_lay.setContentsMargins(14, 10, 14, 10)
+        zone_lay.setSpacing(2)
+
+        # Primary is a short single-line prompt / filename — no wrap so it can't
+        # be clipped; the labels span the full zone width and centre their text.
+        self.zone_primary = QLabel()
+        self.zone_primary.setAlignment(Qt.AlignCenter)
+        self.zone_secondary = QLabel()
+        self.zone_secondary.setWordWrap(True)
+        self.zone_secondary.setAlignment(Qt.AlignCenter)
+
+        # Indeterminate loader shown only while a file is being validated.
+        self.zone_progress = QProgressBar()
+        self.zone_progress.setRange(0, 0)
+        self.zone_progress.setTextVisible(False)
+        self.zone_progress.setFixedHeight(6)
+        self.zone_progress.setMaximumWidth(180)
+        self.zone_progress.setVisible(False)
+        self.zone_progress.setStyleSheet(
+            f"QProgressBar {{ background: {COLOR_BORDER}; border: none; "
+            f"border-radius: 3px; }}"
+            f"QProgressBar::chunk {{ background: {COLOR_PRIMARY}; "
+            f"border-radius: 3px; }}"
+        )
+
+        # Let clicks on the labels fall through to the zone's browse handler.
+        for w in (self.zone_primary, self.zone_secondary, self.zone_progress):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        zone_lay.addStretch()
+        zone_lay.addWidget(self.zone_primary)
+        zone_lay.addWidget(self.zone_secondary)
+        zone_lay.addWidget(self.zone_progress, 0, Qt.AlignHCenter)
+        zone_lay.addStretch()
+        layout.addWidget(self.zone)
+
+        # Read-only path display + Clear (browsing happens by clicking the zone).
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText(placeholder)
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse)
+        self.path_edit.setReadOnly(True)
+        self.path_edit.setStyleSheet(
+            f"background: {COLOR_SIDEBAR_BG}; color: {COLOR_MUTED};"
+        )
+        # Let file drops fall through to the card instead of the line edit
+        # inserting the raw "file://…" URL as text.
+        self.path_edit.setAcceptDrops(False)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.path_edit.clear)
+        self.clear_btn.setEnabled(False)
+        self.path_edit.textChanged.connect(
+            lambda t: self.clear_btn.setEnabled(bool(t))
+        )
         path_row.addWidget(self.path_edit)
-        path_row.addWidget(browse_btn)
+        path_row.addWidget(self.clear_btn)
         layout.addLayout(path_row)
+
+        self.setAcceptDrops(True)
+        self.set_state(None)   # render the empty state
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select file", self.path_edit.text(), self._filter)
         if path:
             self.path_edit.setText(path)
 
-    def set_status(self, text, color, bold=False):
-        weight = "font-weight: bold; " if bold else ""
-        self.status_lbl.setText(text)
-        self.status_lbl.setStyleSheet(f"color: {color}; {weight}font-size: 11px;")
+    # Rendering
+    def _paint_zone(self, border, bg):
+        self.zone.setStyleSheet(
+            f"QFrame#DropZone {{ border: 2px dashed {border}; "
+            f"border-radius: 12px; background: {bg}; }}"
+        )
+
+    def _set_badge(self, text, color, bg):
+        self.badge.setText(text)
+        self.badge.setStyleSheet(
+            f"background: {bg}; color: {color}; border-radius: 9px; "
+            f"padding: 2px 10px; font-size: 11px; font-weight: 600;"
+        )
+
+    def set_loading(self, name):
+        """Show the pending loader while the file is inspected off-thread."""
+        self._set_badge("checking", COLOR_MUTED, BADGE_BG_OPTIONAL)
+        self._paint_zone(COLOR_PRIMARY, ZONE_BG_NEUTRAL)
+        self.zone_primary.setText(f"Validating {name}…")
+        self.zone_primary.setStyleSheet(
+            f"color: {COLOR_TEXT}; font-size: 13px; font-weight: 600;")
+        self.zone_secondary.setText("")
+        self.zone_secondary.setVisible(False)
+        self.zone_progress.setVisible(True)
+
+    def set_state(self, state, message="", warn=False):
+        """Render a validation outcome. state: True/False/None (no path)."""
+        self._last = (state, message, warn)
+        self.zone_progress.setVisible(False)
+        path = self.path_edit.text().strip()
+        name = os.path.basename(path) if path else ""
+        size = (f"{os.path.getsize(path) / (1024 * 1024):.0f} MB"
+                if path and os.path.isfile(path) else "")
+
+        if state is True:
+            color = COLOR_WARNING if warn else COLOR_FILE_OK
+            bg = ZONE_BG_WARN if warn else ZONE_BG_OK
+            self._set_badge("warning" if warn else "valid", color, bg)
+            self._paint_zone(color, bg)
+            self.zone_primary.setText(name)
+            self.zone_primary.setStyleSheet(
+                f"color: {color}; font-size: 13px; font-weight: 700;")
+            detail = " · ".join(p for p in ("NetCDF", size, message, "drop to replace") if p)
+            self.zone_secondary.setText(detail)
+            self.zone_secondary.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+        elif state is False:
+            self._set_badge("invalid", COLOR_FILE_ERROR, ZONE_BG_ERR)
+            self._paint_zone(COLOR_FILE_ERROR, ZONE_BG_ERR)
+            self.zone_primary.setText(name or "Invalid file")
+            self.zone_primary.setStyleSheet(
+                f"color: {COLOR_FILE_ERROR}; font-size: 13px; font-weight: 700;")
+            self.zone_secondary.setText(message or "File could not be validated")
+            self.zone_secondary.setStyleSheet(f"color: {COLOR_FILE_ERROR}; font-size: 11px;")
+        else:   # no path
+            if self._optional:
+                self._set_badge("optional", COLOR_MUTED, BADGE_BG_OPTIONAL)
+            else:
+                self._set_badge("required", COLOR_REQUIRED, BADGE_BG_REQUIRED)
+            self._paint_zone(COLOR_BORDER, ZONE_BG_NEUTRAL)
+            self.zone_primary.setText("Click to browse or drag & drop")
+            self.zone_primary.setStyleSheet(
+                f"color: {COLOR_TEXT}; font-size: 13px; font-weight: 600;")
+            self.zone_secondary.setText("")
+            self.zone_secondary.setStyleSheet(f"color: {COLOR_MUTED}; font-size: 11px;")
+
+        # Hide the detail line when empty so the prompt centres vertically alone.
+        self.zone_secondary.setVisible(bool(self.zone_secondary.text()))
+
+    # Drag & drop
+    @staticmethod
+    def _drop_path(event):
+        """Return the first local file path from a drag event, or None."""
+        md = event.mimeData()
+        if not md.hasUrls():
+            return None
+        for url in md.urls():
+            local = url.toLocalFile()
+            if local and os.path.isfile(local):
+                return local
+        return None
+
+    def dragEnterEvent(self, event):
+        if self._drop_path(event):
+            event.acceptProposedAction()
+            self._paint_zone(COLOR_PRIMARY, COLOR_PRIMARY_SOFT)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.set_state(*self._last)   # restore the pre-drag rendering
+
+    def dropEvent(self, event):
+        path = self._drop_path(event)
+        if path:
+            self.path_edit.setText(path)   # fires validation → repaints the zone
+            event.acceptProposedAction()
+        else:
+            self.set_state(*self._last)
 
     def text(self):
         return self.path_edit.text()
@@ -244,13 +245,28 @@ class WeatherPage(QWizardPage):
         self.config = config
         self._weather_valid = None   # None=no path, False=invalid, True=valid
         self._depth_valid = None
+        self._weather_loading = False
+        self._depth_loading = False
+        self._tasks = {}         # field -> in-flight InspectNetcdfTask
+        self._info = {}          # kind -> last inspect_netcdf() result (or None)
+        self._info_path = {}     # kind -> path that _info was computed for
         self.status = None
         self._build_ui()
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        root = QVBoxLayout(inner)
         root.setContentsMargins(28, 22, 28, 18)
         root.setSpacing(14)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
 
         root.addWidget(page_header(
             "Weather & depth datasets",
@@ -258,16 +274,17 @@ class WeatherPage(QWizardPage):
             "Files are validated against your route before you proceed.",
         ))
 
-        self.weather_field = _FileField(
+        self.weather_field = FileField(
             "Weather data",
             "/path/to/weather.nc"
         )
         self.weather_field.path_edit.textChanged.connect(self._on_weather_changed)
         root.addWidget(self.weather_field)
 
-        self.depth_field = _FileField(
+        self.depth_field = FileField(
             "Bathymetry data",
-            "/path/to/depth.nc"
+            "/path/to/depth.nc",
+            optional=True,
         )
         self.depth_field.path_edit.textChanged.connect(self._on_depth_changed)
         root.addWidget(self.depth_field)
@@ -289,9 +306,7 @@ class WeatherPage(QWizardPage):
         self.time_forecast.setSuffix("  h")
         self.time_forecast.setToolTip("Total forecast hours (default: 90 h)")
         # Re-check time coverage when the forecast horizon changes
-        self.time_forecast.valueChanged.connect(
-            lambda: self._validate_weather(self.weather_field.text().strip())
-        )
+        self.time_forecast.valueChanged.connect(self._on_forecast_changed)
 
         time_form.addRow(opt_label("Forecast time resolution", "DELTA_TIME_FORECAST"), self.delta_time)
         time_form.addRow(opt_label("Forecast horizon", "TIME_FORECAST"), self.time_forecast)
@@ -299,8 +314,13 @@ class WeatherPage(QWizardPage):
 
         root.addStretch()
 
+        # Status line pinned below the scroll area so it stays visible.
+        status_wrap = QWidget()
+        sw = QVBoxLayout(status_wrap)
+        sw.setContentsMargins(28, 0, 28, 12)
         self.status = StatusLine()
-        root.addWidget(self.status)
+        sw.addWidget(self.status)
+        outer.addWidget(status_wrap)
         self._update_status()
 
     # Config helpers
@@ -340,86 +360,119 @@ class WeatherPage(QWizardPage):
 
     # Validation
 
-    def _validate(self, path, require_time):
-        """Validate a NetCDF file; return (state, status_text, color, bold).
-
-        state is True (valid), False (invalid) or None (no path given).
-        """
-        if not path:
-            return None, "No file selected", COLOR_MUTED, False
-
-        if not os.path.isfile(path):
-            return False, "File not found", COLOR_FILE_ERROR, False
-
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-
-        try:
-            info = inspect_netcdf(path)
-        except Exception as e:
-            return False, f"✗  {e}", COLOR_FILE_ERROR, False
-
-        extent = info["extent"]
-        checks = []
-        warns = []
-
-        map_coords = self._parse_map_coords()
-        if map_coords:
-            lat_min, lon_min, lat_max, lon_max = map_coords
-            if not _covers(extent, lat_min, lon_min, lat_max, lon_max):
-                e_lat_min, e_lon_min, e_lat_max, e_lon_max = extent
-                return (False,
-                        f"✗  Spatial coverage [{e_lat_min:.2f}°, {e_lon_min:.2f}°, "
-                        f"{e_lat_max:.2f}°, {e_lon_max:.2f}°] does not cover "
-                        f"map [{lat_min}°, {lon_min}°, {lat_max}°, {lon_max}°]",
-                        COLOR_FILE_ERROR, False)
-            checks.append("spatial ✓")
-
-        if require_time:
-            if "time" not in info:
-                return (False,
-                        "✗  No time dimension found (required for weather data)",
-                        COLOR_FILE_ERROR, False)
-            departure = self._parse_departure_time()
-            if departure:
-                end = departure + timedelta(hours=self.time_forecast.value())
-                t_min, t_max = info["time"]
-                if not (t_min <= departure <= t_max and t_min <= end <= t_max):
-                    return (False,
-                            f"✗  Time coverage [{t_min:%Y-%m-%d %H:%M}, "
-                            f"{t_max:%Y-%m-%d %H:%M}] does not cover routing period "
-                            f"[{departure:%Y-%m-%d %H:%M}, {end:%Y-%m-%d %H:%M}]",
-                            COLOR_FILE_ERROR, False)
-                checks.append("time ✓")
-
-        detail = "  ".join(checks) if checks else "structure OK"
-        base = f"✓  {os.path.basename(path)}  —  {size_mb:.0f} MB  —  {detail}"
-        if warns:
-            return (True, base + "    ⚠ " + "; ".join(warns), COLOR_WARNING, True)
-        return (True, base, COLOR_FILE_OK, True)
+    def _check_coverage(self, info, require_time):
+        """Gather page state and run the pure coverage check against ``info``."""
+        return check_coverage(
+            info,
+            self._parse_map_coords(),
+            self._parse_departure_time(),
+            self.time_forecast.value(),
+            require_time,
+        )
 
     def _validate_weather(self, path):
-        state, text, color, bold = self._validate(path, require_time=True)
-        self._weather_valid = state
-        self.weather_field.set_status(text, color, bold)
+        self._begin_validate(self.weather_field, "weather", path, require_time=True)
+
+    def _validate_depth(self, path):
+        self._begin_validate(self.depth_field, "depth", path, require_time=False)
+
+    def _begin_validate(self, field, kind, path, require_time):
+        """Kick off validation for a field: cheap cases inline, file I/O async."""
+        # Supersede any in-flight inspection for this field.
+        old = self._tasks.pop(field, None)
+        if old is not None:
+            old.cancel()
+
+        if not path:
+            self._forget_info(kind)
+            self._set_loading(kind, False)
+            self._apply_result(field, kind, None, "", False)
+            return
+        if not os.path.isfile(path):
+            self._forget_info(kind)
+            self._set_loading(kind, False)
+            self._apply_result(field, kind, False, "File not found", False)
+            return
+
+        # Reuse a cached inspection for the same path (e.g. re-selecting the same
+        # file) — only the cheap coverage check runs, on the UI thread.
+        if self._info_path.get(kind) == path and self._info.get(kind) is not None:
+            self._set_loading(kind, False)
+            state, msg, warn = self._check_coverage(self._info[kind], require_time)
+            self._apply_result(field, kind, state, msg, warn)
+            return
+
+        # Inspect the file off the UI thread; show the loader meanwhile.
+        self._set_loading(kind, True)
+        field.set_loading(os.path.basename(path))
+        task = InspectNetcdfTask(path)
+        task.done.connect(
+            lambda info, err, t=task:
+            self._on_inspect_done(field, kind, path, require_time, t, info, err)
+        )
+        self._tasks[field] = task
+        mgr = QgsApplication.taskManager()
+        if mgr is not None:
+            mgr.addTask(task)
+        else:   # no task manager (e.g. outside QGIS) — run inline as a fallback
+            task.run()
+            task.done.emit(task.info, task.error)
+
+    def _on_inspect_done(self, field, kind, path, require_time, task, info, error):
+        """Main-thread completion handler for an InspectNetcdfTask."""
+        if self._tasks.get(field) is not task:
+            return   # superseded by a newer inspection
+        self._tasks.pop(field, None)
+        if field.text().strip() != path:
+            return   # the path changed while we were inspecting
+        self._set_loading(kind, False)
+        if error is not None:
+            self._forget_info(kind)
+            self._apply_result(field, kind, False, str(error), False)
+            return
+        self._info[kind] = info
+        self._info_path[kind] = path
+        state, msg, warn = self._check_coverage(info, require_time)
+        self._apply_result(field, kind, state, msg, warn)
+
+    def _on_forecast_changed(self):
+        """Re-check time coverage on a horizon change, reusing the cached
+        inspection so a spinbox tick never re-opens the file or spawns a task."""
+        path = self.weather_field.text().strip()
+        if not path or self._weather_loading:
+            return   # nothing loaded, or an in-flight load will use the new value
+        if self._info_path.get("weather") == path and self._info.get("weather"):
+            state, msg, warn = self._check_coverage(self._info["weather"], True)
+            self._apply_result(self.weather_field, "weather", state, msg, warn)
+
+    def _apply_result(self, field, kind, state, message, warn):
+        """Render a result on the field and refresh page-level status/completion."""
+        if kind == "weather":
+            self._weather_valid = state
+        else:
+            self._depth_valid = state
+        field.set_state(state, message, warn)
         self._update_status()
         self.completeChanged.emit()
 
-    def _validate_depth(self, path):
-        if not path:
-            self._depth_valid = None
-            self.depth_field.set_status("Optional — leave blank to skip", COLOR_MUTED, False)
-            self._update_status()
-            self.completeChanged.emit()
-            return
-        state, text, color, bold = self._validate(path, require_time=False)
-        self._depth_valid = state
-        self.depth_field.set_status(text, color, bold)
+    def _set_loading(self, kind, on):
+        if kind == "weather":
+            self._weather_loading = on
+        else:
+            self._depth_loading = on
         self._update_status()
         self.completeChanged.emit()
+
+    def _forget_info(self, kind):
+        self._info[kind] = None
+        self._info_path[kind] = None
 
     def _update_status(self):
         if self.status is None:
             return  # still being constructed
+        if self._weather_loading or self._depth_loading:
+            self.status.set_pending("Validating datasets…")
+            return
         depth_ok = self._depth_valid is True or self._depth_valid is None
         if self._weather_valid is True and depth_ok:
             if self._depth_valid is True:
@@ -439,6 +492,8 @@ class WeatherPage(QWizardPage):
         self._validate_depth(text.strip())
 
     def isComplete(self):
+        if self._weather_loading or self._depth_loading:
+            return False
         depth_ok = self._depth_valid is True or self._depth_valid is None
         return self._weather_valid is True and depth_ok
 
